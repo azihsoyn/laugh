@@ -486,9 +486,15 @@ fn draw(f: &mut ratatui::Frame<'_>, area: Rect, app: &mut FilesView) {
     }
     f.render_widget(Paragraph::new(Line::from(summary)), summary_area);
 
-    // No directory holds more files than the whole tree, so padding both
-    // sides of `done/total` to that many digits lines the slashes up.
-    let digits = app.files.len().to_string().len();
+    // Pad both sides of `done/total` to the widest total any directory row
+    // shows (the root itself is never a row), so the slashes line up.
+    let digits = app
+        .dirs
+        .iter()
+        .skip(1)
+        .map(|d| d.all_files.len().to_string().len())
+        .max()
+        .unwrap_or(1);
     let rows: Vec<Row> = app
         .rows_with_guides()
         .into_iter()
@@ -519,7 +525,7 @@ fn draw(f: &mut ratatui::Frame<'_>, area: Rect, app: &mut FilesView) {
                         Cell::from(Line::from(name)),
                         Cell::from(Line::from(ui::gauge(done, total, 8))),
                         Cell::from(Span::styled(
-                            format!("{done:>digits$}/{total:<digits$}"),
+                            format!("{done:>digits$}/{total:>digits$}"),
                             theme::muted(),
                         )),
                         count_cell(adds, '+', theme::GREEN),
