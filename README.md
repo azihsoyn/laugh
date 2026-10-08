@@ -77,7 +77,7 @@ laugh pr 123 --json                                # for scripts and agents
 A PR is `123` (the current repository, or `--repo`), `owner/repo#123`, or a
 URL — links copied from a comment or the Files tab work as they are.
 
-laugh opens on **1 Files**; **2 Threads** is one key (or click) away. With
+laugh opens on **1 Files**; **2 Threads** and **3 Checks** are one key (or click) away. With
 more than one PR open, a switcher above them offers **All** — every PR in
 one tree and one list of threads — or one PR at a time.
 
@@ -150,11 +150,20 @@ agent:
 3. Otherwise it's copied to the clipboard (`pbcopy`, `wl-copy`, `xclip`,
    `xsel`, `clip.exe`, or the terminal's OSC 52).
 
+### 3 · Checks
+
+Every check and status on each PR's latest commit, failures first. For a
+failed GitHub Actions job, laugh shows which step failed, the errors and
+warnings it reported against files (`path:line`), and the tail of that
+step's log — the command it ran and its output up to the error — fetched
+when you land on it. Checks from other CI services show their state and a
+link.
+
 ### Keys
 
 | | |
 |---|---|
-| `1` `2` | Files / Threads |
+| `1` `2` `3` | Files / Threads / Checks |
 | `[` `]` | All PRs, or one at a time |
 | `?` | every key |
 | `q` | quit (after anything still being saved) |
@@ -178,6 +187,11 @@ agent:
 | `r` | hide / show resolved |
 | `f` | open → resolved → outdated → all |
 
+| Checks | |
+|---|---|
+| `j` `k` | move between checks |
+| `J` `K` | scroll the failing step's log |
+
 The mouse works too: click a screen tab or a PR in the switcher, and scroll
 with the wheel. While laugh has the mouse, most terminals need Shift (or
 Option) held to select text.
@@ -186,12 +200,13 @@ Option) held to select text.
 
 `laugh pr … --json` prints every changed file with its Viewed state
 (`VIEWED` / `UNVIEWED` / `DISMISSED`) — and, for generated files, why they
-count as generated — and every review thread, unfiltered,
+count as generated — every review thread, and every check with its state,
+failed step and annotations, unfiltered,
 in the same shape for one PR or many:
 
 ```json
 { "prs": [ { "pr": { "owner": "…", "repo": "…", "number": 123, "title": "…", "url": "…" },
-             "files": [ … ], "threads": [ … ] } ] }
+             "files": [ … ], "threads": [ … ], "checks": [ … ] } ] }
 ```
 
 Narrow it with `jq`.
