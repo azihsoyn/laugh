@@ -441,24 +441,19 @@ fn viewed_icon(state: ViewedState) -> Span<'static> {
     }
 }
 
-fn diff_cell(additions: u64, deletions: u64) -> Cell<'static> {
-    let mut spans = Vec::new();
-    if additions > 0 {
-        spans.push(Span::styled(
-            format!("+{additions}"),
-            Style::default().fg(theme::GREEN),
-        ));
+/// `+N` or `-N` right-aligned in its own column, blank for zero, so the
+/// added and removed counts each line up down the tree.
+fn count_cell(n: u64, sign: char, color: ratatui::style::Color) -> Cell<'static> {
+    if n == 0 {
+        return Cell::from("");
     }
-    if deletions > 0 {
-        if !spans.is_empty() {
-            spans.push(Span::raw(" "));
-        }
-        spans.push(Span::styled(
-            format!("-{deletions}"),
-            Style::default().fg(theme::RED),
-        ));
-    }
-    Cell::from(Line::from(spans).right_aligned())
+    Cell::from(
+        Line::from(Span::styled(
+            format!("{sign}{n}"),
+            Style::default().fg(color),
+        ))
+        .right_aligned(),
+    )
 }
 
 fn draw(f: &mut ratatui::Frame<'_>, area: Rect, app: &mut FilesView) {
@@ -491,6 +486,15 @@ fn draw(f: &mut ratatui::Frame<'_>, area: Rect, app: &mut FilesView) {
     }
     f.render_widget(Paragraph::new(Line::from(summary)), summary_area);
 
+    // Pad both sides of `done/total` to the widest total any directory row
+    // shows (the root itself is never a row), so the slashes line up.
+    let digits = app
+        .dirs
+        .iter()
+        .skip(1)
+        .map(|d| d.all_files.len().to_string().len())
+        .max()
+        .unwrap_or(1);
     let rows: Vec<Row> = app
         .rows_with_guides()
         .into_iter()
@@ -520,11 +524,12 @@ fn draw(f: &mut ratatui::Frame<'_>, area: Rect, app: &mut FilesView) {
                     Row::new(vec![
                         Cell::from(Line::from(name)),
                         Cell::from(Line::from(ui::gauge(done, total, 8))),
-                        Cell::from(
-                            Line::from(Span::styled(format!("{done}/{total}"), theme::muted()))
-                                .right_aligned(),
-                        ),
-                        diff_cell(adds, dels),
+                        Cell::from(Span::styled(
+                            format!("{done:>digits$}/{total:>digits$}"),
+                            theme::muted(),
+                        )),
+                        count_cell(adds, '+', theme::GREEN),
+                        count_cell(dels, '-', theme::RED),
                     ])
                 }
                 RowRef::File { file, .. } => {
@@ -542,20 +547,29 @@ fn draw(f: &mut ratatui::Frame<'_>, area: Rect, app: &mut FilesView) {
                         ])),
                         Cell::from(""),
                         Cell::from(""),
-                        diff_cell(pf.additions, pf.deletions),
+                        count_cell(pf.additions, '+', theme::GREEN),
+                        count_cell(pf.deletions, '-', theme::RED),
                     ])
                 }
             }
         })
         .collect();
 
+    // Wide enough for the biggest count on screen: every directory total
+    // is at most the whole tree's, so size the columns from that.
+    let (all_adds, all_dels) = app
+        .files
+        .iter()
+        .fold((0, 0), |(a, d), f| (a + f.additions, d + f.deletions));
+    let width = |n: u64| format!("+{n}").len() as u16;
     let table = Table::new(
         rows,
         [
             Constraint::Min(20),
             Constraint::Length(8),
-            Constraint::Length(7),
-            Constraint::Length(14),
+            Constraint::Length(2 * digits as u16 + 1),
+            Constraint::Length(width(all_adds)),
+            Constraint::Length(width(all_dels)),
         ],
     )
     .column_spacing(2)
