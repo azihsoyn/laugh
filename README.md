@@ -5,6 +5,11 @@ awkward, without opening a browser. Think Refined GitHub, but for the
 terminal, and able to hold several related pull requests in one view: the app
 change, its infra change and the design-system bump, reviewed together.
 
+![laugh demo](demo.gif)
+
+*The demo opens this repository's own pull requests #1 and #2 together —
+try `laugh pr azihsoyn/laugh#1 azihsoyn/laugh#2`.*
+
 The name is an ordinary word with `gh` hiding inside it.
 
 Reads and writes through the `gh` CLI's existing credentials — nothing to
