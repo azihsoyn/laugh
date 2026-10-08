@@ -309,7 +309,11 @@ fn draw_footer(f: &mut ratatui::Frame<'_>, area: Rect, app: &PrApp) {
     let mut spans = vec![Span::raw(" ")];
     spans.extend(ui::key_hints(&hints));
 
-    let note = match app.files.status() {
+    let status = match app.screen {
+        Screen::Files => app.files.status(),
+        Screen::Threads => app.threads.status(),
+    };
+    let note = match status {
         Some(status) => Some(Span::styled(
             format!("{status} "),
             Style::default().fg(theme::YELLOW),
@@ -360,6 +364,7 @@ const HELP: &[(&str, &[(&str, &str)])] = &[
             ("j  k", "scroll"),
             ("space", "scroll the thread or the code"),
             ("tab", "next person"),
+            ("a", "send the thread to your agent"),
             ("r", "hide / show resolved"),
             ("f", "open → resolved → outdated → all"),
         ],

@@ -8,6 +8,7 @@ use ratatui::widgets::{Block, BorderType, Borders, Paragraph, Wrap};
 use unicode_width::UnicodeWidthStr;
 
 use crate::format::{clean_body, snippet};
+use crate::handoff;
 use crate::model::Thread;
 use crate::{theme, ui};
 
@@ -127,8 +128,12 @@ pub struct ThreadsView {
     /// `owner/repo#N`-style labels per opened PR; shown on cards and the
     /// code pane only when there is more than one.
     pr_labels: Vec<String>,
+    /// `owner/repo#N` per opened PR, for what's handed to an agent.
+    pr_refs: Vec<String>,
     /// `None` shows every open PR's threads together; `Some(i)` just the i-th.
     scope: Option<usize>,
+    /// The outcome of the last hand-off to an agent, shown in the footer.
+    status: Option<String>,
     state_filter: StateFilter,
     tabs: Vec<Tab>,
     selected_tab: usize,
@@ -143,13 +148,15 @@ pub struct ThreadsView {
 }
 
 impl ThreadsView {
-    pub fn new(threads: Vec<Thread>, pr_labels: Vec<String>) -> Self {
+    pub fn new(threads: Vec<Thread>, pr_labels: Vec<String>, pr_refs: Vec<String>) -> Self {
         let tabs = build_tabs(&threads);
         let selected_tab = default_tab_index(&tabs);
         let mut view = ThreadsView {
             threads,
             pr_labels,
+            pr_refs,
             scope: None,
+            status: None,
             state_filter: StateFilter::All,
             tabs,
             selected_tab,
@@ -288,8 +295,27 @@ impl ThreadsView {
             .then(|| self.pr_labels[thread.pr].as_str())
     }
 
+    pub fn status(&self) -> Option<&str> {
+        self.status.as_deref()
+    }
+
+    /// Writes the selected thread up as a prompt and hands it to an agent.
+    fn hand_off(&mut self) {
+        let Some(thread) = self.selected_thread() else {
+            return;
+        };
+        let pr = self.pr_refs.get(thread.pr).map_or("", String::as_str);
+        let prompt = handoff::thread_prompt(pr, thread);
+        self.status = Some(match handoff::deliver(&prompt) {
+            Ok(delivered) => delivered.describe(),
+            Err(e) => format!("couldn't hand the thread off: {e:#}"),
+        });
+    }
+
     pub fn handle_key(&mut self, code: KeyCode) {
+        self.status = None;
         match code {
+            KeyCode::Char('a') => self.hand_off(),
             KeyCode::Char('l') | KeyCode::Right => self.move_card(1),
             KeyCode::Char('h') | KeyCode::Left => self.move_card(-1),
             KeyCode::Char('j') | KeyCode::Down => self.scroll_focused(1),
@@ -331,6 +357,7 @@ impl ThreadsView {
             ("↑↓", "scroll"),
             ("space", "code ⇄ thread"),
             ("tab", "person"),
+            ("a", "to agent"),
             resolved,
         ]
     }
