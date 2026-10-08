@@ -129,6 +129,22 @@ the bots' own scratch work, and keeps what was actually said.
 `r` hides resolved threads; `f` steps through open / resolved / outdated /
 all.
 
+#### Hand a thread to your agent
+
+`a` writes the thread up for a coding agent — the comments, the file and
+line, the code it's on, and a note that the comments are review feedback
+from other people rather than instructions — and puts it in front of the
+agent:
+
+1. `LAUGH_SEND_CMD`, if set, gets it on stdin (run with `sh -c`), so it can
+   go wherever you like: `tmux load-buffer - && tmux paste-buffer -t agent`,
+   a file, another tool.
+2. Inside [herdr](https://herdr.dev), it's pasted into the agent pane in the
+   same tab (an idle one first) — pasted, not sent, so you can add to it
+   and press Enter yourself.
+3. Otherwise it's copied to the clipboard (`pbcopy`, `wl-copy`, `xclip`,
+   `xsel`, `clip.exe`, or the terminal's OSC 52).
+
 ### Keys
 
 | | |
@@ -152,6 +168,7 @@ all.
 | `j` `k` · `J` `K` | scroll · scroll faster |
 | `space` | scroll the thread or the code |
 | `tab` `shift-tab` | next / previous person |
+| `a` | hand the thread to your agent |
 | `r` | hide / show resolved |
 | `f` | open → resolved → outdated → all |
 

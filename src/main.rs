@@ -1,6 +1,7 @@
 mod files_view;
 mod format;
 mod github;
+mod handoff;
 mod logo;
 mod model;
 mod pr_app;
@@ -282,7 +283,7 @@ fn run_pr(args: PrArgs) -> Result<()> {
     pr_app::run(
         headers,
         files_view::FilesView::new(pr_ids, &labels, files),
-        threads_view::ThreadsView::new(threads, labels),
+        threads_view::ThreadsView::new(threads, labels, refs.iter().map(PrRef::full).collect()),
     )
 }
 
