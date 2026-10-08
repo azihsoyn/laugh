@@ -1,9 +1,9 @@
 [package]
 name = "laugh"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 rust-version = "1.88"
-description = "The GitHub you'd want in a terminal: every review thread including resolved ones, and the changed files with their Viewed state — for one pull request or a related set across repositories"
+description = "Review a GitHub pull request without leaving the terminal: every review thread including resolved ones, Viewed state for the changed files, CI failures with their logs, and a reading order"
 license = "MIT"
 repository = "https://github.com/azihsoyn/laugh"
 homepage = "https://github.com/azihsoyn/laugh"

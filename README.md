@@ -46,7 +46,7 @@ eyes, beside a one-line diff that turns a frown into a laugh.
 
 ```sh
 brew install azihsoyn/tap/laugh                            # Homebrew (macOS/Linux)
-cargo install --git https://github.com/azihsoyn/laugh      # or build it (Rust 1.88+)
+cargo install laugh                                        # or build it (Rust 1.88+)
 ```
 
 Or the prebuilt binary for macOS, Linux or Windows, from the
