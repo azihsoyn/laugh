@@ -496,11 +496,15 @@ fn draw_cards(f: &mut ratatui::Frame<'_>, area: Rect, app: &ThreadsView) {
                 Style::default().fg(theme::BRAND),
             ));
         }
-        let mut card = Paragraph::new(lines).block(block);
+        // Tint only inside the border: a background under the border cells
+        // reads as a smudge around the rounded corners.
+        let inner = block.inner(chunks[slot]);
+        f.render_widget(block, chunks[slot]);
+        let mut card = Paragraph::new(lines);
         if is_selected {
             card = card.style(theme::selected_row());
         }
-        f.render_widget(card, chunks[slot]);
+        f.render_widget(card, inner);
     }
 
     if indices.len() > visible_count {
