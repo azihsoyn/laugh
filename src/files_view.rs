@@ -159,6 +159,30 @@ pub struct OpenRequest {
     pub head: String,
 }
 
+/// A bulk Viewed change waiting on a yes / no.
+#[derive(Debug)]
+struct Confirm {
+    targets: Vec<usize>,
+    viewed: bool,
+    /// What the files have in common, for the dialog's title and question.
+    what: Bulk,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Bulk {
+    Generated,
+    Matching(String),
+}
+
+/// Case-insensitive: every whitespace-separated word of `filter` appears
+/// somewhere in `path`.
+fn matches_filter(path: &str, filter: &str) -> bool {
+    let path = path.to_lowercase();
+    filter
+        .split_whitespace()
+        .all(|word| path.contains(&word.to_lowercase()))
+}
+
 /// One PR's diffs, by path, as GitHub serves them.
 enum Patches {
     Loading,
@@ -237,7 +261,11 @@ pub struct FilesView {
     table: TableState,
     status: Option<String>,
     /// Generated files waiting on a yes / no before they're marked viewed.
-    confirm: Option<Vec<usize>>,
+    confirm: Option<Confirm>,
+    /// `/`: only files whose path contains every word of this.
+    filter: String,
+    /// Typing the filter: keys go into it.
+    filtering: bool,
     ledger: Ledger,
     /// `None` only in tests, where nothing should reach GitHub.
     worker: Option<Worker>,
@@ -270,6 +298,52 @@ impl FilesView {
 
     fn file_visible(&self, file: usize) -> bool {
         !(self.hide_viewed && self.files[file].viewed == ViewedState::Viewed)
+            && matches_filter(&self.files[file].path, &self.filter)
+    }
+
+    /// Files in scope that match the filter, viewed or not.
+    fn matching(&self) -> Vec<usize> {
+        self.dirs[self.view_root()]
+            .all_files
+            .iter()
+            .copied()
+            .filter(|&f| matches_filter(&self.files[f].path, &self.filter))
+            .collect()
+    }
+
+    fn filter_key(&mut self, code: KeyCode) {
+        match code {
+            KeyCode::Enter => self.filtering = false,
+            KeyCode::Esc => {
+                self.filtering = false;
+                self.filter.clear();
+            }
+            KeyCode::Backspace => {
+                self.filter.pop();
+            }
+            KeyCode::Down => return self.move_by(1),
+            KeyCode::Up => return self.move_by(-1),
+            KeyCode::Char(c) => self.filter.push(c),
+            _ => return,
+        }
+        self.table.select(Some(0));
+        self.clamp();
+    }
+
+    /// `V` while filtering: every match at once, after asking.
+    fn ask_to_toggle_matching(&mut self) {
+        let (targets, viewed) = toggle_plan(&self.files, &self.matching());
+        match targets.len() {
+            0 => self.status = Some("no files match".to_string()),
+            1 => self.apply_toggle(&targets),
+            _ => {
+                self.confirm = Some(Confirm {
+                    targets,
+                    viewed,
+                    what: Bulk::Matching(self.filter.trim().to_string()),
+                })
+            }
+        }
     }
 
     fn dir_visible(&self, dir: usize) -> bool {
@@ -625,6 +699,8 @@ impl FilesView {
             table: TableState::default(),
             status: None,
             confirm: None,
+            filter: String::new(),
+            filtering: false,
             worker: Some(Worker::spawn(pr_ids)),
         };
         view.clamp();
@@ -679,7 +755,7 @@ impl FilesView {
 
     /// True while Esc should close the diff rather than quit.
     pub fn takes_esc(&self) -> bool {
-        self.diff.open
+        self.diff.open || !self.filter.is_empty()
     }
 
     /// A file waiting to be opened with `LAUGH_OPEN_CMD`.
@@ -740,9 +816,10 @@ impl FilesView {
             .collect()
     }
 
-    /// True while the confirmation dialog is open and should get every key.
+    /// True while a dialog is open or the filter is being typed, and every
+    /// key should come here.
     pub fn is_modal(&self) -> bool {
-        self.confirm.is_some()
+        self.confirm.is_some() || self.filtering
     }
 
     fn ask_to_mark_generated(&mut self) {
@@ -750,22 +827,38 @@ impl FilesView {
         if targets.is_empty() {
             self.status = Some("no unviewed generated files here".to_string());
         } else {
-            self.confirm = Some(targets);
+            self.confirm = Some(Confirm {
+                targets,
+                viewed: true,
+                what: Bulk::Generated,
+            });
         }
     }
 
     fn answer_confirm(&mut self, code: KeyCode) {
         match code {
             KeyCode::Char('y') | KeyCode::Enter => {
-                let targets = self.confirm.take().unwrap_or_default();
-                let count = targets.len();
-                let jobs = self.ledger.apply(&mut self.files, &targets, true);
+                let Some(confirm) = self.confirm.take() else {
+                    return;
+                };
+                let jobs = self
+                    .ledger
+                    .apply(&mut self.files, &confirm.targets, confirm.viewed);
                 if let Some(worker) = &self.worker {
                     for job in jobs {
                         worker.send(job);
                     }
                 }
-                self.status = Some(format!("{count} generated file(s) marked viewed"));
+                let count = confirm.targets.len();
+                let how = if confirm.viewed {
+                    "marked viewed"
+                } else {
+                    "unmarked"
+                };
+                self.status = Some(match confirm.what {
+                    Bulk::Generated => format!("{count} generated file(s) {how}"),
+                    Bulk::Matching(q) => format!("{count} file(s) matching “{q}” {how}"),
+                });
                 self.clamp();
             }
             KeyCode::Char('n') | KeyCode::Char('q') | KeyCode::Esc => self.confirm = None,
@@ -775,8 +868,26 @@ impl FilesView {
 
     pub fn handle_key(&mut self, code: KeyCode) {
         self.status = None;
-        if self.is_modal() {
+        if self.confirm.is_some() {
             self.answer_confirm(code);
+            return;
+        }
+        if self.filtering {
+            self.filter_key(code);
+            return;
+        }
+        if code == KeyCode::Char('/') {
+            self.filtering = true;
+            self.diff.open = false;
+            return;
+        }
+        if code == KeyCode::Esc && !self.diff.open && !self.filter.is_empty() {
+            self.filter.clear();
+            self.clamp();
+            return;
+        }
+        if code == KeyCode::Char('V') && !self.filter.trim().is_empty() {
+            self.ask_to_toggle_matching();
             return;
         }
         if code == KeyCode::Char('m') {
@@ -876,8 +987,20 @@ impl FilesView {
         } else {
             ("H", "hide viewed")
         };
-        if self.is_modal() {
-            return vec![("y", "mark them viewed"), ("n", "cancel")];
+        if self.confirm.is_some() {
+            return vec![("y", "yes"), ("n", "cancel")];
+        }
+        if self.filtering {
+            return vec![("type", "filter by path"), ("⏎", "done"), ("esc", "clear")];
+        }
+        if !self.filter.trim().is_empty() && !self.diff.open {
+            return vec![
+                ("V", "viewed: every match"),
+                ("v", "this file"),
+                ("/", "edit"),
+                ("esc", "clear filter"),
+                hide,
+            ];
         }
         let mut hints = match self.current() {
             Some(RowRef::Dir(_)) => vec![("V", "viewed: everything inside"), ("⏎", "fold"), hide],
@@ -942,13 +1065,29 @@ fn count_cell(n: u64, sign: char, color: ratatui::style::Color) -> Cell<'static>
 
 /// "Mark these N generated files viewed?" — listing what and why, since it
 /// writes to GitHub for files the reviewer hasn't opened.
-fn draw_confirm(f: &mut ratatui::Frame<'_>, area: Rect, app: &FilesView, targets: &[usize]) {
+fn draw_confirm(f: &mut ratatui::Frame<'_>, area: Rect, app: &FilesView, confirm: &Confirm) {
     const SHOWN: usize = 12;
+    let targets = &confirm.targets;
+    let (verb, done) = if confirm.viewed {
+        ("Mark ", " as viewed?")
+    } else {
+        ("Unmark ", " — back to not viewed?")
+    };
+    let (kind, title) = match &confirm.what {
+        Bulk::Generated => (
+            " generated file(s)".to_string(),
+            "Generated files".to_string(),
+        ),
+        Bulk::Matching(q) => (
+            format!(" file(s) matching “{q}”"),
+            format!("Files matching “{q}”"),
+        ),
+    };
     let mut lines = vec![
         Line::from(vec![
-            Span::styled("Mark ", theme::text()),
+            Span::styled(verb, theme::text()),
             Span::styled(format!("{}", targets.len()), theme::bold(theme::accent())),
-            Span::styled(" generated file(s) as viewed?", theme::text()),
+            Span::styled(format!("{kind}{done}"), theme::text()),
         ]),
         Line::raw(""),
     ];
@@ -973,7 +1112,17 @@ fn draw_confirm(f: &mut ratatui::Frame<'_>, area: Rect, app: &FilesView, targets
     }
     lines.push(Line::raw(""));
     let mut keys = vec![Span::raw("  ")];
-    keys.extend(ui::key_hints(&[("y", "mark them viewed"), ("n", "cancel")]));
+    keys.extend(ui::key_hints(&[
+        (
+            "y",
+            if confirm.viewed {
+                "mark them viewed"
+            } else {
+                "unmark them"
+            },
+        ),
+        ("n", "cancel"),
+    ]));
     lines.push(Line::from(keys));
 
     let width = lines
@@ -985,10 +1134,7 @@ fn draw_confirm(f: &mut ratatui::Frame<'_>, area: Rect, app: &FilesView, targets
         .clamp(44, area.width.saturating_sub(4));
     let popup = ui::centered(area, width, lines.len() as u16 + 2);
     f.render_widget(Clear, popup);
-    f.render_widget(
-        Paragraph::new(lines).block(ui::panel("Generated files", true)),
-        popup,
-    );
+    f.render_widget(Paragraph::new(lines).block(ui::panel(&title, true)), popup);
 }
 
 /// The selected file's diff, beside the tree.
@@ -1076,6 +1222,21 @@ fn draw(f: &mut ratatui::Frame<'_>, area: Rect, app: &mut FilesView) {
     if app.hide_viewed {
         summary.push(Span::raw("   "));
         summary.push(Span::styled(" hiding viewed ", theme::pill_on()));
+    }
+    if app.filtering || !app.filter.is_empty() {
+        summary.push(Span::raw("   "));
+        summary.push(Span::styled(" / ", theme::pill_on()));
+        summary.push(Span::styled(
+            format!(" {}", app.filter),
+            theme::bold(theme::text()),
+        ));
+        if app.filtering {
+            summary.push(Span::styled("▏", theme::accent()));
+        }
+        summary.push(Span::styled(
+            format!("  {} match", app.matching().len()),
+            theme::muted(),
+        ));
     }
     if app.order_mode {
         summary.push(Span::raw("   "));
@@ -1215,8 +1376,8 @@ fn draw(f: &mut ratatui::Frame<'_>, area: Rect, app: &mut FilesView) {
         draw_diff(f, diff_area, app);
     }
 
-    if let Some(targets) = &app.confirm {
-        draw_confirm(f, area, app, targets);
+    if let Some(confirm) = &app.confirm {
+        draw_confirm(f, area, app, confirm);
     }
 }
 
@@ -1319,6 +1480,8 @@ mod tests {
             table: TableState::default(),
             status: None,
             confirm: None,
+            filter: String::new(),
+            filtering: false,
             worker: None,
             sources: Vec::new(),
             file_dir: Vec::new(),
@@ -1412,6 +1575,8 @@ mod tests {
             table: TableState::default(),
             status: None,
             confirm: None,
+            filter: String::new(),
+            filtering: false,
             worker: None,
             sources: Vec::new(),
             file_dir: Vec::new(),
@@ -1468,7 +1633,10 @@ mod tests {
         let mut a = app(fs, false);
         a.handle_key(KeyCode::Char('m'));
         // In tree order: the snapshot's directory comes before root files.
-        assert_eq!(a.confirm.as_deref(), Some(&[2, 1][..]));
+        assert_eq!(
+            a.confirm.as_ref().map(|c| c.targets.as_slice()),
+            Some(&[2, 1][..])
+        );
         a.handle_key(KeyCode::Char('n'));
         assert!(a.confirm.is_none());
         assert_eq!(
@@ -1547,5 +1715,55 @@ mod tests {
         assert_eq!((a.diff.scroll, a.selected_file()), (3, Some(0)));
         a.wheel(true, Position::new(10, 5));
         assert_eq!((a.diff.scroll, a.selected_file()), (3, Some(1)));
+    }
+
+    #[test]
+    fn slash_filters_by_path_and_v_marks_every_match_after_asking() {
+        let mut a = app(
+            files(&["src/a.spec.ts", "src/a.ts", "lib/b.spec.ts", "README.md"]),
+            false,
+        );
+        a.handle_key(KeyCode::Char('/'));
+        assert!(a.is_modal(), "typing goes to the filter");
+        for c in "SPEC".chars() {
+            a.handle_key(KeyCode::Char(c));
+        }
+        a.handle_key(KeyCode::Enter);
+        assert!(!a.is_modal());
+        let mut shown: Vec<usize> = a
+            .rows()
+            .into_iter()
+            .filter_map(|r| match r {
+                RowRef::File { file, .. } => Some(file),
+                RowRef::Dir(_) => None,
+            })
+            .collect();
+        shown.sort();
+        assert_eq!(shown, [0, 2], "case-insensitive, any depth");
+
+        a.handle_key(KeyCode::Char('V'));
+        let confirm = a.confirm.as_ref().expect("asks first");
+        assert_eq!(confirm.what, Bulk::Matching("SPEC".into()));
+        a.handle_key(KeyCode::Char('y'));
+        let viewed: Vec<bool> = a
+            .files
+            .iter()
+            .map(|f| f.viewed == ViewedState::Viewed)
+            .collect();
+        assert_eq!(viewed, [true, false, true, false]);
+
+        assert!(a.takes_esc());
+        a.handle_key(KeyCode::Esc);
+        assert!(
+            a.filter.is_empty() && !a.takes_esc(),
+            "esc clears the filter"
+        );
+    }
+
+    #[test]
+    fn every_word_of_the_filter_must_appear() {
+        assert!(matches_filter("apps/web/src/Button.spec.ts", "web spec"));
+        assert!(!matches_filter("apps/api/src/Button.spec.ts", "web spec"));
+        assert!(matches_filter("anything", "  "));
     }
 }

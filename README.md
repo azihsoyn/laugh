@@ -110,6 +110,12 @@ is shown. Quitting waits for anything still queued.
 
 `H` hides what you've viewed, and any directory with nothing left in it.
 
+`/` filters the tree by path as you type — case-insensitive, and every word
+must appear (`log spec` finds `log-store/JsonStreamWriter.spec.ts`). `⏎`
+keeps the filter, `Esc` clears it. While it's on, `V` covers every match at
+once: after showing you the list and asking, it marks them viewed (or, if
+they all are already, unmarks them).
+
 Generated files — lockfiles, snapshots, minified bundles, code generators'
 output, and anything the repository marks `linguist-generated` in its
 `.gitattributes` (what GitHub itself collapses) — are labelled with why.
@@ -208,6 +214,7 @@ link.
 | `H` | hide / show viewed files |
 | `m` | viewed: every generated file (asks first) |
 | `o` | reading order / tree |
+| `/` | filter by path · then `V` for every match (asks first) |
 | `⏎` on a file | its diff (or `LAUGH_OPEN_CMD`) |
 | `J` `K` · `Esc` | scroll the diff · close it |
 

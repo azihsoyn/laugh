@@ -438,6 +438,7 @@ const HELP: &[(&str, &[(&str, &str)])] = &[
             ("H", "hide / show viewed files"),
             ("m", "viewed: generated files (asks first)"),
             ("o", "reading order / tree"),
+            ("/", "filter by path · V marks every match"),
             ("g  G", "top / bottom"),
         ],
     ),
