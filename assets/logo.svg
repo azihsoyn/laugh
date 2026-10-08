@@ -1,0 +1,42 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 660 173" width="660" height="173" role="img" aria-label="laugh — the GitHub you'd want in a terminal. A review comment smiling with two Viewed ticks for eyes, beside a diff that changes frown to laugh, with the gh in laugh highlighted.">
+  <style>
+    text { font-family: "SF Mono", Menlo, Consolas, "DejaVu Sans Mono", "Liberation Mono", monospace; font-size: 20px; white-space: pre; }
+    .bubble { fill: #7aa2f7; }
+    .eye { fill: #9ece6a; font-weight: 700; }
+    .mouth { fill: #ff9e64; }
+    .num { fill: #565f89; }
+    .del { fill: #f7768e; }
+    .add { fill: #9ece6a; }
+    .frown { fill: #7a82a8; }
+    .word { fill: #c0caf5; font-weight: 700; }
+    .gh { fill: #ff9e64; font-weight: 700; }
+    .tag { fill: #7a82a8; font-size: 16px; }
+  </style>
+  <defs>
+    <filter id="glow" x="-100%" y="-100%" width="300%" height="300%">
+      <feGaussianBlur stdDeviation="2.5" result="b"/>
+      <feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge>
+    </filter>
+  </defs>
+  <rect x="1" y="1" width="658" height="171" rx="14" fill="#1a1b26" stroke="#292e42" stroke-width="2"/>
+  <rect x="204.0" y="50.4" width="168.0" height="23.4" fill="#3a222a"/>
+  <rect x="204.0" y="73.8" width="168.0" height="23.4" fill="#1d2921"/>
+  <text class="bubble" x="30.0 42.0 54.0 66.0 78.0 90.0 102.0 114.0 126.0 138.0 150.0" y="43.2">╭─────────╮</text>
+  <text class="bubble" x="30.0" y="66.6">│</text>
+  <text class="eye" filter="url(#glow)" x="66.0" y="66.6">✓</text>
+  <text class="eye" filter="url(#glow)" x="114.0" y="66.6">✓</text>
+  <text class="bubble" x="150.0" y="66.6">│</text>
+  <text class="num" x="210.0 222.0" y="66.6">12</text>
+  <text class="del" x="246.0" y="66.6">-</text>
+  <text class="frown" x="270.0 282.0 294.0 306.0 318.0" y="66.6">frown</text>
+  <text class="bubble" x="30.0" y="90.0">│</text>
+  <text class="mouth" x="66.0 78.0 90.0 102.0 114.0" y="90.0">╰───╯</text>
+  <text class="bubble" x="150.0" y="90.0">│</text>
+  <text class="num" x="210.0 222.0" y="90.0">12</text>
+  <text class="add" x="246.0" y="90.0">+</text>
+  <text class="word" x="270.0 282.0 294.0" y="90.0">lau</text>
+  <text class="gh" filter="url(#glow)" x="306.0 318.0" y="90.0">gh</text>
+  <text class="bubble" x="30.0 42.0 54.0 66.0 78.0 90.0 102.0 114.0 126.0 138.0 150.0" y="113.4">╰─┬───────╯</text>
+  <text class="tag" x="210.0" y="136.8">the GitHub you&#x27;d want in a terminal</text>
+  <text class="bubble" x="54.0" y="136.8">╰</text>
+</svg>
