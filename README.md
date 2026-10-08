@@ -3,8 +3,7 @@
 </p>
 
 <p align="center">
-  Review pull requests in the terminal: every review thread, resolved ones included,<br>
-  and the changed files with GitHub's own Viewed checkboxes — for one PR or a related set across repositories.
+  <b>Your code, your agent and your review — in the same terminal.</b>
 </p>
 
 <p align="center">
@@ -19,8 +18,10 @@
 <p align="center"><sub>The demo opens this repository's own PRs #1 and #2 together — try
 <code>laugh pr azihsoyn/laugh#1 azihsoyn/laugh#2</code>.</sub></p>
 
-GitHub's web UI is built for one pull request in one tab, and it quietly
-hides things a reviewer needs:
+Your editor, git and your coding agent already live in the terminal. Code
+review is the one thing that still sends you out to a browser — and the
+browser was built for one pull request in one tab, and quietly hides things
+a reviewer needs:
 
 - **Resolving a thread folds it away.** Afterwards, finding what was raised
   and what was done about it means clicking each one open.
