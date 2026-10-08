@@ -249,8 +249,9 @@ link.
 | `j` `k` | move between checks |
 | `J` `K` | scroll the failing step's log |
 
-The mouse works too: click a screen tab or a PR in the switcher, and scroll
-with the wheel. While laugh has the mouse, most terminals need Shift (or
+The mouse works too: click a screen tab, a PR in the switcher or a row of
+the files tree, and scroll with the wheel (over the diff, it scrolls the
+diff). While laugh has the mouse, most terminals need Shift (or
 Option) held to select text.
 
 ## `--json`

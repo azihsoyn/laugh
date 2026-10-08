@@ -229,6 +229,8 @@ fn handle_mouse(app: &mut PrApp, kind: MouseEventKind, at: Position) {
             } else if let Some((scope, _)) = app.pr_hits.iter().find(|(_, r)| r.contains(at)) {
                 let scope = *scope;
                 app.set_scope(scope);
+            } else if app.screen == Screen::Files {
+                app.files.click(at);
             }
         }
         MouseEventKind::ScrollDown | MouseEventKind::ScrollUp if !app.help => {

@@ -362,6 +362,8 @@ pub struct FilesView {
     /// the diff here.
     open_cmd: Option<String>,
     open_request: Option<OpenRequest>,
+    /// Where the tree's rows were last drawn, for mouse clicks.
+    tree_area: Option<Rect>,
 }
 
 impl FilesView {
@@ -801,6 +803,7 @@ impl FilesView {
                 .ok()
                 .filter(|c| !c.trim().is_empty()),
             open_request: None,
+            tree_area: None,
             sources,
             dirs,
             pr_roots,
@@ -891,6 +894,17 @@ impl FilesView {
             };
         } else {
             self.handle_key(if down { KeyCode::Down } else { KeyCode::Up });
+        }
+    }
+
+    /// A left click: on a row of the tree, puts the cursor there.
+    pub fn click(&mut self, at: Position) {
+        let Some(area) = self.tree_area.filter(|a| a.contains(at)) else {
+            return;
+        };
+        let row = self.table.offset() + (at.y - area.y) as usize;
+        if row < self.rows().len() {
+            self.table.select(Some(row));
         }
     }
 
@@ -1496,6 +1510,7 @@ fn draw(f: &mut ratatui::Frame<'_>, area: Rect, app: &mut FilesView) {
         (list_area, None)
     };
     f.render_stateful_widget(table, list_area, &mut app.table);
+    app.tree_area = Some(list_area.inner(ratatui::layout::Margin::new(1, 1)));
     app.diff.area = diff_area;
     if let Some(diff_area) = diff_area {
         draw_diff(f, diff_area, app);
@@ -1617,6 +1632,7 @@ mod tests {
             diff: DiffPane::default(),
             open_cmd: None,
             open_request: None,
+            tree_area: None,
         }
     }
 
@@ -1724,6 +1740,7 @@ mod tests {
             diff: DiffPane::default(),
             open_cmd: None,
             open_request: None,
+            tree_area: None,
         }
     }
 
@@ -1983,5 +2000,19 @@ mod tests {
         a.filter.clear();
         a.handle_key(KeyCode::Char('V'));
         assert_eq!(viewed(&a), [true, true, true]);
+    }
+
+    #[test]
+    fn a_click_on_a_row_puts_the_cursor_there() {
+        let mut a = app(files(&["a/x.ts", "a/y.ts", "b.md"]), false);
+        a.clamp();
+        a.tree_area = Some(Rect::new(1, 5, 50, 10));
+        *a.table.offset_mut() = 1;
+        a.click(Position::new(10, 6)); // second visible row = row 2
+        assert_eq!(a.selected_file(), Some(0));
+        a.click(Position::new(10, 14)); // below the last row
+        assert_eq!(a.selected_file(), Some(0));
+        a.click(Position::new(60, 5)); // outside the tree
+        assert_eq!(a.selected_file(), Some(0));
     }
 }
