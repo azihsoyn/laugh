@@ -438,8 +438,22 @@ impl FilesView {
             return self.order_rows();
         }
         let mut rows = Vec::new();
-        self.push_contents(self.view_root(), &mut rows);
+        let root = self.view_root();
+        if self.root_row() {
+            rows.push(RowRef::Dir(root));
+            if self.collapsed.contains(&root) {
+                return rows;
+            }
+        }
+        self.push_contents(root, &mut rows);
         rows
+    }
+
+    /// The tree starts with a row for its root — `/`, or the PR picked
+    /// with `[ ]` — so `V` there covers everything. Not in the All view of
+    /// several PRs, whose top rows are the PRs themselves.
+    fn root_row(&self) -> bool {
+        (self.pr_roots.len() == 1 || self.scope.is_some()) && self.dir_visible(self.view_root())
     }
 
     /// PRs in the current scope, in order.
@@ -578,7 +592,15 @@ impl FilesView {
                 .collect();
         }
         let mut rows = Vec::new();
-        self.push_guided(self.view_root(), "", true, &mut rows);
+        let root = self.view_root();
+        if self.root_row() {
+            rows.push((RowRef::Dir(root), String::new()));
+            if !self.collapsed.contains(&root) {
+                self.push_guided(root, "", false, &mut rows);
+            }
+        } else {
+            self.push_guided(root, "", true, &mut rows);
+        }
         rows
     }
 
@@ -1350,11 +1372,10 @@ fn draw(f: &mut ratatui::Frame<'_>, area: Rect, app: &mut FilesView) {
     f.render_widget(Paragraph::new(Line::from(summary)), summary_area);
 
     // Pad both sides of `done/total` to the widest total any directory row
-    // shows (the root itself is never a row), so the slashes line up.
+    // shows, so the slashes line up.
     let digits = app
         .dirs
         .iter()
-        .skip(1)
         .map(|d| d.all_files.len().to_string().len())
         .max()
         .unwrap_or(1);
@@ -1383,6 +1404,8 @@ fn draw(f: &mut ratatui::Frame<'_>, area: Rect, app: &mut FilesView) {
                     if node.pr_root {
                         name.push(Span::styled("▣ ", Style::default().fg(theme::BRAND)));
                         name.push(Span::styled(node.label.clone(), theme::bold(theme::text())));
+                    } else if d == ROOT {
+                        name.push(Span::styled("/", theme::bold(theme::accent())));
                     } else {
                         name.push(Span::styled(
                             node.label.clone(),
@@ -1601,6 +1624,7 @@ mod tests {
         a.rows()
             .into_iter()
             .map(|r| match r {
+                RowRef::Dir(ROOT) => "/".to_string(),
                 RowRef::Dir(d) => a.dirs[d].label.clone(),
                 RowRef::File { file, .. } => a.files[file].file_name().to_string(),
             })
@@ -1610,7 +1634,7 @@ mod tests {
     #[test]
     fn rows_walk_the_tree_directories_before_files() {
         let a = app(files(&["a/b/x.ts", "a/z.ts", "root.md"]), false);
-        assert_eq!(row_labels(&a), ["a/", "b/", "x.ts", "z.ts", "root.md"]);
+        assert_eq!(row_labels(&a), ["/", "a/", "b/", "x.ts", "z.ts", "root.md"]);
     }
 
     #[test]
@@ -1623,7 +1647,7 @@ mod tests {
             ],
             true,
         );
-        assert_eq!(row_labels(&a), ["a/", "todo/", "y.ts"]);
+        assert_eq!(row_labels(&a), ["/", "a/", "todo/", "y.ts"]);
     }
 
     #[test]
@@ -1633,11 +1657,22 @@ mod tests {
         let order: Vec<RowRef> = guided.iter().map(|(r, _)| *r).collect();
         assert_eq!(order, a.rows());
         let guides: Vec<&str> = guided.iter().map(|(_, g)| g.as_str()).collect();
-        // a/ ─┬ b/ ─┬ x.ts
-        //     │     └ y.ts
-        //     └ z.ts
-        // root.md
-        assert_eq!(guides, ["", "├─ ", "│  ├─ ", "│  └─ ", "└─ ", ""]);
+        // / ─┬ a/ ─┬ b/ ─┬ x.ts
+        //    │     │     └ y.ts
+        //    │     └ z.ts
+        //    └ root.md
+        assert_eq!(
+            guides,
+            [
+                "",
+                "├─ ",
+                "│  ├─ ",
+                "│  │  ├─ ",
+                "│  │  └─ ",
+                "│  └─ ",
+                "└─ "
+            ]
+        );
     }
 
     #[test]
@@ -1645,7 +1680,7 @@ mod tests {
         let mut a = app(files(&["a/b/x.ts", "a/z.ts", "root.md"]), false);
         let a_dir = a.dirs[ROOT].subdirs[0];
         a.collapsed.insert(a_dir);
-        assert_eq!(row_labels(&a), ["a/", "root.md"]);
+        assert_eq!(row_labels(&a), ["/", "a/", "root.md"]);
     }
 
     #[test]
@@ -1714,7 +1749,11 @@ mod tests {
     fn scoping_to_one_pr_shows_just_its_tree_and_counts() {
         let mut a = multi_pr_app();
         a.set_scope(Some(1));
-        assert_eq!(row_labels(&a), ["terraform/", "main.tf", "README.md"]);
+        assert_eq!(
+            row_labels(&a),
+            ["infra#2", "terraform/", "main.tf", "README.md"],
+            "a single PR's tree starts at its own row"
+        );
         assert_eq!(a.viewed_counts(), (0, 2));
     }
 
@@ -1794,7 +1833,7 @@ mod tests {
     #[test]
     fn enter_on_a_file_opens_the_diff_and_esc_closes_it() {
         let mut a = app(files(&["src/a.rs", "src/b.rs"]), false);
-        a.table.select(Some(1));
+        a.table.select(Some(2));
         assert_eq!(a.selected_file(), Some(0));
         a.handle_key(KeyCode::Enter);
         assert!(a.takes_esc(), "the diff is open");
@@ -1810,7 +1849,7 @@ mod tests {
     #[test]
     fn the_wheel_scrolls_the_diff_under_the_pointer_and_moves_the_cursor_elsewhere() {
         let mut a = app(files(&["src/a.rs", "src/b.rs"]), false);
-        a.table.select(Some(1));
+        a.table.select(Some(2));
         a.handle_key(KeyCode::Enter);
         a.diff.area = Some(Rect::new(40, 0, 60, 20));
         a.wheel(true, Position::new(50, 5));
@@ -1925,5 +1964,24 @@ mod tests {
             unreachable!()
         };
         assert_eq!(a.dir_files(d), [0], "its count is of matches only");
+    }
+
+    #[test]
+    fn v_on_the_root_row_covers_the_whole_pr_and_only_matches_when_filtered() {
+        let mut a = app(files(&["src/a.spec.ts", "src/a.ts", "README.md"]), false);
+        a.clamp();
+        assert_eq!(a.current(), Some(RowRef::Dir(ROOT)), "the tree opens on /");
+        a.filter.set("*.ts".to_string());
+        a.handle_key(KeyCode::Char('V'));
+        let viewed = |a: &FilesView| -> Vec<bool> {
+            a.files
+                .iter()
+                .map(|f| f.viewed == ViewedState::Viewed)
+                .collect()
+        };
+        assert_eq!(viewed(&a), [true, true, false]);
+        a.filter.clear();
+        a.handle_key(KeyCode::Char('V'));
+        assert_eq!(viewed(&a), [true, true, true]);
     }
 }
