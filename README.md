@@ -107,6 +107,11 @@ is shown. Quitting waits for anything still queued.
 
 `H` hides what you've viewed, and any directory with nothing left in it.
 
+Generated files — lockfiles, snapshots, minified bundles, code generators'
+output, and anything the repository marks `linguist-generated` in its
+`.gitattributes` (what GitHub itself collapses) — are labelled with why.
+`m` marks all of them viewed at once, after showing you the list and asking.
+
 ### 2 · Threads
 
 Every review thread — open, resolved and outdated — as a row of cards. The
@@ -161,6 +166,7 @@ agent:
 | `v` | viewed: this file |
 | `V` | viewed: everything in this directory, or this PR |
 | `H` | hide / show viewed files |
+| `m` | viewed: every generated file (asks first) |
 
 | Threads | |
 |---|---|
@@ -179,7 +185,8 @@ Option) held to select text.
 ## `--json`
 
 `laugh pr … --json` prints every changed file with its Viewed state
-(`VIEWED` / `UNVIEWED` / `DISMISSED`) and every review thread, unfiltered,
+(`VIEWED` / `UNVIEWED` / `DISMISSED`) — and, for generated files, why they
+count as generated — and every review thread, unfiltered,
 in the same shape for one PR or many:
 
 ```json

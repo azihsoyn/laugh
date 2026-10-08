@@ -19,6 +19,9 @@ pub struct PrFile {
     pub additions: u64,
     pub deletions: u64,
     pub viewed: ViewedState,
+    /// Why the file counts as generated (`lockfile`, `.gitattributes`, …).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub generated: Option<&'static str>,
 }
 
 impl PrFile {
