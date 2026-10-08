@@ -22,29 +22,64 @@ pub struct PrHeader {
     pub repo: String,
     pub number: u64,
     pub title: String,
+    /// Short name for the PR switcher, e.g. `infra#45`.
+    pub label: String,
 }
 
-/// One pull request, one TUI: the changed files and the review threads are
-/// two screens of the same app, switched with 1 / 2.
+/// One TUI for one or more pull requests: the changed files and the review
+/// threads are two screens (1 / 2), and with several PRs open a switcher
+/// shows them all together or one at a time ([ / ]).
 struct PrApp {
-    header: PrHeader,
+    prs: Vec<PrHeader>,
+    /// `None` shows every open PR together; `Some(i)` just the i-th.
+    scope: Option<usize>,
     screen: Screen,
     help: bool,
     /// Where each screen tab was last drawn, for mouse clicks.
     tab_hits: Vec<(Screen, Rect)>,
+    /// Same for the PR switcher.
+    pr_hits: Vec<(Option<usize>, Rect)>,
     files: FilesView,
     threads: ThreadsView,
 }
 
-pub fn run(header: PrHeader, files: FilesView, threads: ThreadsView) -> Result<()> {
+impl PrApp {
+    fn set_scope(&mut self, scope: Option<usize>) {
+        self.scope = scope;
+        self.files.set_scope(scope);
+        self.threads.set_scope(scope);
+    }
+
+    /// Steps through All, then each PR, wrapping around.
+    fn cycle_scope(&mut self, delta: i64) {
+        let n = self.prs.len() as i64;
+        if n < 2 {
+            return;
+        }
+        let pos = self.scope.map_or(0, |i| i as i64 + 1);
+        let next = (pos + delta).rem_euclid(n + 1);
+        self.set_scope(if next == 0 {
+            None
+        } else {
+            Some(next as usize - 1)
+        });
+    }
+}
+
+pub fn run(prs: Vec<PrHeader>, files: FilesView, threads: ThreadsView) -> Result<()> {
     let mut app = PrApp {
-        header,
+        prs,
+        scope: None,
         screen: Screen::Files,
         help: false,
         tab_hits: Vec::new(),
+        pr_hits: Vec::new(),
         files,
         threads,
     };
+    if app.prs.len() == 1 {
+        app.set_scope(Some(0));
+    }
     with_terminal(|terminal| {
         let result = event_loop(terminal, &mut app);
         if app.files.pending() > 0 {
@@ -85,6 +120,8 @@ fn event_loop(terminal: &mut Term, app: &mut PrApp) -> Result<()> {
             KeyCode::Char('?') => app.help = true,
             KeyCode::Char('1') => app.screen = Screen::Files,
             KeyCode::Char('2') => app.screen = Screen::Threads,
+            KeyCode::Char(']') => app.cycle_scope(1),
+            KeyCode::Char('[') => app.cycle_scope(-1),
             code => match app.screen {
                 Screen::Files => app.files.handle_key(code),
                 Screen::Threads => app.threads.handle_key(code),
@@ -109,6 +146,9 @@ fn handle_mouse(app: &mut PrApp, kind: MouseEventKind, at: Position) {
                 app.help = false;
             } else if let Some(screen) = tab_at(&app.tab_hits, at) {
                 app.screen = screen;
+            } else if let Some((scope, _)) = app.pr_hits.iter().find(|(_, r)| r.contains(at)) {
+                let scope = *scope;
+                app.set_scope(scope);
             }
         }
         MouseEventKind::ScrollDown | MouseEventKind::ScrollUp if !app.help => {
@@ -127,8 +167,10 @@ fn handle_mouse(app: &mut PrApp, kind: MouseEventKind, at: Position) {
 }
 
 fn draw(f: &mut ratatui::Frame<'_>, app: &mut PrApp) {
-    let [top, tabs, gap, body, footer] = Layout::vertical([
+    let switcher = if app.prs.len() > 1 { 1 } else { 0 };
+    let [top, prs, tabs, gap, body, footer] = Layout::vertical([
         Constraint::Length(1),
+        Constraint::Length(switcher),
         Constraint::Length(1),
         Constraint::Length(1),
         Constraint::Min(0),
@@ -136,7 +178,10 @@ fn draw(f: &mut ratatui::Frame<'_>, app: &mut PrApp) {
     ])
     .areas(f.area());
 
-    draw_top(f, top, &app.header);
+    draw_top(f, top, app);
+    if switcher > 0 {
+        draw_pr_switcher(f, prs, app);
+    }
     draw_tabs(f, tabs, app);
     f.render_widget(
         Paragraph::new(Span::styled("─".repeat(gap.width as usize), theme::faint())),
@@ -153,16 +198,66 @@ fn draw(f: &mut ratatui::Frame<'_>, app: &mut PrApp) {
     }
 }
 
-fn draw_top(f: &mut ratatui::Frame<'_>, area: Rect, header: &PrHeader) {
-    f.render_widget(
-        Paragraph::new(Line::from(vec![
-            Span::styled(" ◆ laugh ", theme::bold(Style::default().fg(theme::BRAND))),
-            Span::styled(format!(" {} ", header.repo), theme::muted()),
-            Span::styled(format!("#{} ", header.number), theme::bold(theme::accent())),
-            Span::styled(header.title.clone(), theme::bold(theme::text())),
-        ])),
-        area,
+fn draw_top(f: &mut ratatui::Frame<'_>, area: Rect, app: &PrApp) {
+    let mut spans = vec![Span::styled(
+        " ◆ laugh ",
+        theme::bold(Style::default().fg(theme::BRAND)),
+    )];
+    match app.scope {
+        Some(i) => {
+            let header = &app.prs[i];
+            spans.push(Span::styled(format!(" {} ", header.repo), theme::muted()));
+            spans.push(Span::styled(
+                format!("#{} ", header.number),
+                theme::bold(theme::accent()),
+            ));
+            spans.push(Span::styled(
+                header.title.clone(),
+                theme::bold(theme::text()),
+            ));
+        }
+        None => {
+            spans.push(Span::styled(
+                format!(" {} pull requests", app.prs.len()),
+                theme::bold(theme::text()),
+            ));
+            spans.push(Span::styled("  reviewed together", theme::muted()));
+        }
+    }
+    f.render_widget(Paragraph::new(Line::from(spans)), area);
+}
+
+/// `All` plus one pill per PR; records where each landed for clicks.
+fn draw_pr_switcher(f: &mut ratatui::Frame<'_>, area: Rect, app: &mut PrApp) {
+    let mut choices: Vec<(Option<usize>, String)> = vec![(None, "All".to_string())];
+    choices.extend(
+        app.prs
+            .iter()
+            .enumerate()
+            .map(|(i, p)| (Some(i), p.label.clone())),
     );
+
+    let mut spans = vec![Span::raw(" ")];
+    let mut x = area.x + 1;
+    app.pr_hits.clear();
+    for (scope, label) in choices {
+        let text = format!(" {label} ");
+        let width = text.chars().count() as u16;
+        app.pr_hits
+            .push((scope, Rect::new(x, area.y, width, 1).intersection(area)));
+        x += width + 1;
+        let style = if scope == app.scope {
+            Style::default()
+                .fg(theme::ON_ACCENT)
+                .bg(theme::BRAND)
+                .add_modifier(ratatui::style::Modifier::BOLD)
+        } else {
+            theme::muted()
+        };
+        spans.push(Span::styled(text, style));
+        spans.push(Span::raw(" "));
+    }
+    f.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
 fn draw_tabs(f: &mut ratatui::Frame<'_>, area: Rect, app: &mut PrApp) {
@@ -207,6 +302,9 @@ fn draw_footer(f: &mut ratatui::Frame<'_>, area: Rect, app: &PrApp) {
         Screen::Files => app.files.hints(),
         Screen::Threads => app.threads.hints(),
     };
+    if app.prs.len() > 1 {
+        hints.push(("[ ]", "PR"));
+    }
     hints.extend([("?", "keys"), ("q", "quit")]);
     let mut spans = vec![Span::raw(" ")];
     spans.extend(ui::key_hints(&hints));
@@ -239,6 +337,7 @@ const HELP: &[(&str, &[(&str, &str)])] = &[
         "Anywhere",
         &[
             ("1  2", "files / threads"),
+            ("[  ]", "all PRs / one PR at a time"),
             ("?", "this list"),
             ("q", "quit (waits for pending saves)"),
         ],

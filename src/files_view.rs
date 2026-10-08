@@ -26,6 +26,8 @@ struct DirNode {
     files: Vec<usize>,
     /// Every file anywhere underneath — what a directory toggle acts on.
     all_files: Vec<usize>,
+    /// The top of one pull request's files, when several PRs are open.
+    pr_root: bool,
 }
 
 #[derive(Default)]
@@ -34,9 +36,9 @@ struct RawDir {
     files: Vec<usize>,
 }
 
-fn build_tree(files: &[PrFile]) -> Vec<DirNode> {
+fn raw_tree<'a>(files: impl Iterator<Item = (usize, &'a PrFile)>) -> RawDir {
     let mut root = RawDir::default();
-    for (i, f) in files.iter().enumerate() {
+    for (i, f) in files {
         let mut node = &mut root;
         let mut parts: Vec<&str> = f.path.split('/').collect();
         parts.pop();
@@ -45,16 +47,41 @@ fn build_tree(files: &[PrFile]) -> Vec<DirNode> {
         }
         node.files.push(i);
     }
+    root
+}
 
-    let mut dirs = vec![DirNode {
-        label: String::new(),
-        parent: None,
+fn dir_node(label: String, parent: Option<usize>, pr_root: bool) -> DirNode {
+    DirNode {
+        label,
+        parent,
         subdirs: Vec::new(),
         files: Vec::new(),
         all_files: Vec::new(),
-    }];
-    fill(&mut dirs, ROOT, root);
-    dirs
+        pr_root,
+    }
+}
+
+/// Builds the tree and returns it with the node each pull request starts at.
+/// With one PR that is the root itself; with several, each PR gets its own
+/// top-level node so they sit side by side in one tree.
+fn build_tree(files: &[PrFile], pr_labels: &[String]) -> (Vec<DirNode>, Vec<usize>) {
+    let mut dirs = vec![dir_node(String::new(), None, false)];
+    if pr_labels.len() <= 1 {
+        fill(&mut dirs, ROOT, raw_tree(files.iter().enumerate()));
+        return (dirs, vec![ROOT]);
+    }
+    let mut roots = Vec::new();
+    let mut all = Vec::new();
+    for (pr, label) in pr_labels.iter().enumerate() {
+        let id = dirs.len();
+        dirs.push(dir_node(label.clone(), Some(ROOT), true));
+        dirs[ROOT].subdirs.push(id);
+        let raw = raw_tree(files.iter().enumerate().filter(|(_, f)| f.pr == pr));
+        all.extend(fill(&mut dirs, id, raw));
+        roots.push(id);
+    }
+    dirs[ROOT].all_files = all;
+    (dirs, roots)
 }
 
 /// Moves `raw`'s contents under `dirs[id]`, creating child nodes, and
@@ -70,13 +97,7 @@ fn fill(dirs: &mut Vec<DirNode>, id: usize, raw: RawDir) -> Vec<usize> {
             child = grandchild;
         }
         let child_id = dirs.len();
-        dirs.push(DirNode {
-            label,
-            parent: Some(id),
-            subdirs: Vec::new(),
-            files: Vec::new(),
-            all_files: Vec::new(),
-        });
+        dirs.push(dir_node(label, Some(id), false));
         dirs[id].subdirs.push(child_id);
         all.extend(fill(dirs, child_id, child));
     }
@@ -116,6 +137,9 @@ enum RowRef {
 pub struct FilesView {
     files: Vec<PrFile>,
     dirs: Vec<DirNode>,
+    pr_roots: Vec<usize>,
+    /// `None` shows every open PR together; `Some(i)` just the i-th.
+    scope: Option<usize>,
     collapsed: HashSet<usize>,
     hide_viewed: bool,
     table: TableState,
@@ -126,6 +150,17 @@ pub struct FilesView {
 }
 
 impl FilesView {
+    /// The node the tree is drawn from for the current scope.
+    fn view_root(&self) -> usize {
+        self.scope.map_or(ROOT, |pr| self.pr_roots[pr])
+    }
+
+    pub fn set_scope(&mut self, scope: Option<usize>) {
+        self.scope = scope;
+        self.table.select(Some(0));
+        self.clamp();
+    }
+
     fn file_visible(&self, file: usize) -> bool {
         !(self.hide_viewed && self.files[file].viewed == ViewedState::Viewed)
     }
@@ -139,7 +174,7 @@ impl FilesView {
 
     fn rows(&self) -> Vec<RowRef> {
         let mut rows = Vec::new();
-        self.push_contents(ROOT, &mut rows);
+        self.push_contents(self.view_root(), &mut rows);
         rows
     }
 
@@ -164,7 +199,7 @@ impl FilesView {
     /// that draws its place in the hierarchy.
     fn rows_with_guides(&self) -> Vec<(RowRef, String)> {
         let mut rows = Vec::new();
-        self.push_guided(ROOT, "", true, &mut rows);
+        self.push_guided(self.view_root(), "", true, &mut rows);
         rows
     }
 
@@ -225,7 +260,7 @@ impl FilesView {
     }
 
     fn select_dir(&mut self, dir: usize) {
-        if dir == ROOT {
+        if dir == self.view_root() {
             return;
         }
         if let Some(i) = self.rows().iter().position(|r| *r == RowRef::Dir(dir)) {
@@ -261,9 +296,11 @@ impl FilesView {
         if targets.is_empty() {
             return;
         }
-        let job = self.ledger.apply(&mut self.files, &targets, viewed);
+        let jobs = self.ledger.apply(&mut self.files, &targets, viewed);
         if let Some(worker) = &self.worker {
-            worker.send(job);
+            for job in jobs {
+                worker.send(job);
+            }
         }
         self.clamp();
     }
@@ -290,9 +327,10 @@ impl FilesView {
         }
     }
 
+    /// Viewed and total files within the current scope.
     pub fn viewed_counts(&self) -> (usize, usize) {
-        let all: Vec<usize> = (0..self.files.len()).collect();
-        (self.viewed_count(&all), self.files.len())
+        let in_scope = &self.dirs[self.view_root()].all_files;
+        (self.viewed_count(in_scope), in_scope.len())
     }
 
     pub fn pending(&self) -> usize {
@@ -327,16 +365,21 @@ impl FilesView {
         Ok(())
     }
 
-    pub fn new(pr_id: String, files: Vec<PrFile>) -> Self {
+    /// `pr_ids` / `pr_labels` are per opened pull request; each file's `pr`
+    /// indexes into them.
+    pub fn new(pr_ids: Vec<String>, pr_labels: &[String], files: Vec<PrFile>) -> Self {
+        let (dirs, pr_roots) = build_tree(&files, pr_labels);
         let mut view = FilesView {
-            dirs: build_tree(&files),
+            dirs,
+            pr_roots,
+            scope: None,
             ledger: Ledger::new(&files),
             files,
             collapsed: HashSet::new(),
             hide_viewed: false,
             table: TableState::default(),
             status: None,
-            worker: Some(Worker::spawn(pr_id)),
+            worker: Some(Worker::spawn(pr_ids)),
         };
         view.clamp();
         view
@@ -381,7 +424,9 @@ impl FilesView {
                 // they fall back to just themselves rather than the whole PR.
                 let targets = match current {
                     RowRef::Dir(d) => self.dirs[d].all_files.clone(),
-                    RowRef::File { dir, .. } if dir != ROOT => self.dirs[dir].all_files.clone(),
+                    RowRef::File { dir, .. } if dir != self.view_root() => {
+                        self.dirs[dir].all_files.clone()
+                    }
                     RowRef::File { file, .. } => vec![file],
                 };
                 self.apply_toggle(&targets);
@@ -466,10 +511,10 @@ fn draw(f: &mut ratatui::Frame<'_>, area: Rect, app: &mut FilesView) {
         Layout::vertical([Constraint::Length(2), Constraint::Min(0)]).areas(area);
 
     let (viewed, total) = app.viewed_counts();
-    let dismissed = app
-        .files
+    let dismissed = app.dirs[app.view_root()]
+        .all_files
         .iter()
-        .filter(|f| f.viewed == ViewedState::Dismissed)
+        .filter(|&&f| app.files[f].viewed == ViewedState::Dismissed)
         .count();
 
     let mut summary = vec![Span::styled(" Viewed  ", theme::muted())];
@@ -509,11 +554,16 @@ fn draw(f: &mut ratatui::Frame<'_>, area: Rect, app: &mut FilesView) {
                     let (adds, dels) = node.all_files.iter().fold((0, 0), |(a, d), &i| {
                         (a + app.files[i].additions, d + app.files[i].deletions)
                     });
-                    let mut name = vec![
-                        guide,
-                        Span::styled(fold, theme::muted()),
-                        Span::styled(node.label.clone(), theme::bold(theme::accent())),
-                    ];
+                    let mut name = vec![guide, Span::styled(fold, theme::muted())];
+                    if node.pr_root {
+                        name.push(Span::styled("▣ ", Style::default().fg(theme::BRAND)));
+                        name.push(Span::styled(node.label.clone(), theme::bold(theme::text())));
+                    } else {
+                        name.push(Span::styled(
+                            node.label.clone(),
+                            theme::bold(theme::accent()),
+                        ));
+                    }
                     if done == total {
                         name.push(Span::styled(" ✓", Style::default().fg(theme::GREEN)));
                     }
@@ -572,6 +622,7 @@ mod tests {
 
     fn file(path: &str, viewed: ViewedState) -> PrFile {
         PrFile {
+            pr: 0,
             path: path.to_string(),
             additions: 1,
             deletions: 0,
@@ -592,11 +643,14 @@ mod tests {
 
     #[test]
     fn single_child_chains_fold_into_one_node() {
-        let dirs = build_tree(&files(&[
-            "packages/core/src/index.ts",
-            "packages/core/src/index.spec.ts",
-            ".changeset/x.md",
-        ]));
+        let (dirs, _) = build_tree(
+            &files(&[
+                "packages/core/src/index.ts",
+                "packages/core/src/index.spec.ts",
+                ".changeset/x.md",
+            ]),
+            &[],
+        );
         let top: Vec<&str> = dirs[ROOT]
             .subdirs
             .iter()
@@ -608,7 +662,7 @@ mod tests {
     #[test]
     fn branching_directory_keeps_its_children_and_owns_every_file_below() {
         // a/ branches into b/ and c/ and has a file of its own.
-        let dirs = build_tree(&files(&["a/b/x.ts", "a/c/d/y.ts", "a/z.ts"]));
+        let (dirs, _) = build_tree(&files(&["a/b/x.ts", "a/c/d/y.ts", "a/z.ts"]), &[]);
         let a = dirs[ROOT].subdirs[0];
         assert_eq!(label_of(&dirs, a), "a/");
         let children: Vec<&str> = dirs[a]
@@ -650,7 +704,9 @@ mod tests {
 
     fn app(files: Vec<PrFile>, hide_viewed: bool) -> FilesView {
         FilesView {
-            dirs: build_tree(&files),
+            dirs: build_tree(&files, &[]).0,
+            pr_roots: vec![ROOT],
+            scope: None,
             ledger: Ledger::new(&files),
             files,
             collapsed: HashSet::new(),
@@ -722,5 +778,60 @@ mod tests {
         assert!(a.collapsed.contains(&b_dir));
         a.go_left(RowRef::Dir(b_dir));
         assert_eq!(a.current(), Some(RowRef::Dir(a_dir)));
+    }
+
+    fn multi_pr_app() -> FilesView {
+        let mut fs = files(&["src/app.ts", "terraform/main.tf", "README.md"]);
+        fs[1].pr = 1;
+        fs[2].pr = 1;
+        let labels = ["app#1".to_string(), "infra#2".to_string()];
+        let (dirs, pr_roots) = build_tree(&fs, &labels);
+        FilesView {
+            dirs,
+            pr_roots,
+            scope: None,
+            ledger: Ledger::new(&fs),
+            files: fs,
+            collapsed: HashSet::new(),
+            hide_viewed: false,
+            table: TableState::default(),
+            status: None,
+            worker: None,
+        }
+    }
+
+    #[test]
+    fn several_prs_sit_side_by_side_under_their_own_roots() {
+        let a = multi_pr_app();
+        assert_eq!(
+            row_labels(&a),
+            [
+                "app#1",
+                "src/",
+                "app.ts",
+                "infra#2",
+                "terraform/",
+                "main.tf",
+                "README.md"
+            ]
+        );
+        assert_eq!(a.viewed_counts(), (0, 3));
+    }
+
+    #[test]
+    fn scoping_to_one_pr_shows_just_its_tree_and_counts() {
+        let mut a = multi_pr_app();
+        a.set_scope(Some(1));
+        assert_eq!(row_labels(&a), ["terraform/", "main.tf", "README.md"]);
+        assert_eq!(a.viewed_counts(), (0, 2));
+    }
+
+    #[test]
+    fn v_on_a_pr_root_covers_that_pr_only() {
+        let a = multi_pr_app();
+        let infra = a.pr_roots[1];
+        let mut covered = a.dirs[infra].all_files.clone();
+        covered.sort();
+        assert_eq!(covered, [1, 2]);
     }
 }

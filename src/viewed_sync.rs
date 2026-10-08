@@ -8,8 +8,11 @@ use std::thread::{self, JoinHandle};
 use crate::github;
 use crate::model::{PrFile, ViewedState};
 
+/// One write to one pull request. A toggle spanning several PRs becomes one
+/// job per PR, so a failure on one rolls back only that PR's files.
 pub struct Job {
     id: u64,
+    pr: usize,
     paths: Vec<String>,
     viewed: bool,
 }
@@ -47,9 +50,29 @@ impl Ledger {
         self.jobs.len()
     }
 
-    /// Sets every target to the new state right away and returns the job
-    /// that will make GitHub agree.
-    pub fn apply(&mut self, files: &mut [PrFile], targets: &[usize], viewed: bool) -> Job {
+    /// Sets every target to the new state right away and returns the jobs —
+    /// one per pull request involved — that will make GitHub agree.
+    pub fn apply(&mut self, files: &mut [PrFile], targets: &[usize], viewed: bool) -> Vec<Job> {
+        let mut by_pr: Vec<(usize, Vec<usize>)> = Vec::new();
+        for &f in targets {
+            match by_pr.iter_mut().find(|(pr, _)| *pr == files[f].pr) {
+                Some((_, group)) => group.push(f),
+                None => by_pr.push((files[f].pr, vec![f])),
+            }
+        }
+        by_pr
+            .into_iter()
+            .map(|(pr, group)| self.apply_one(files, pr, &group, viewed))
+            .collect()
+    }
+
+    fn apply_one(
+        &mut self,
+        files: &mut [PrFile],
+        pr: usize,
+        targets: &[usize],
+        viewed: bool,
+    ) -> Job {
         let id = self.next_id;
         self.next_id += 1;
         let state = if viewed {
@@ -64,6 +87,7 @@ impl Ledger {
         self.jobs.insert(id, (targets.to_vec(), state));
         Job {
             id,
+            pr,
             paths: targets.iter().map(|&f| files[f].path.clone()).collect(),
             viewed,
         }
@@ -99,13 +123,14 @@ pub struct Worker {
 }
 
 impl Worker {
-    pub fn spawn(pull_request_id: String) -> Self {
+    /// `pull_request_ids[i]` is the GraphQL node id of the i-th opened PR.
+    pub fn spawn(pull_request_ids: Vec<String>) -> Self {
         let (jobs, job_rx) = mpsc::channel::<Job>();
         let (outcome_tx, outcomes) = mpsc::channel();
         let handle = thread::spawn(move || {
             for job in job_rx {
                 let paths: Vec<&str> = job.paths.iter().map(String::as_str).collect();
-                let error = github::set_viewed(&pull_request_id, &paths, job.viewed)
+                let error = github::set_viewed(&pull_request_ids[job.pr], &paths, job.viewed)
                     .err()
                     .map(|e| format!("{e:#}"));
                 if outcome_tx.send(Outcome { id: job.id, error }).is_err() {
@@ -143,6 +168,7 @@ mod tests {
             .iter()
             .enumerate()
             .map(|(i, &viewed)| PrFile {
+                pr: 0,
                 path: format!("f{i}"),
                 additions: 0,
                 deletions: 0,
@@ -155,7 +181,7 @@ mod tests {
     fn apply_changes_the_screen_before_github_answers() {
         let mut fs = files(&[ViewedState::Unviewed, ViewedState::Dismissed]);
         let mut ledger = Ledger::new(&fs);
-        let job = ledger.apply(&mut fs, &[0, 1], true);
+        let job = ledger.apply(&mut fs, &[0, 1], true).remove(0);
         assert_eq!(fs[0].viewed, ViewedState::Viewed);
         assert_eq!(fs[1].viewed, ViewedState::Viewed);
         assert_eq!(job.paths, ["f0", "f1"]);
@@ -167,7 +193,7 @@ mod tests {
         // DISMISSED comes back as DISMISSED, not as "unviewed".
         let mut fs = files(&[ViewedState::Dismissed]);
         let mut ledger = Ledger::new(&fs);
-        let job = ledger.apply(&mut fs, &[0], true);
+        let job = ledger.apply(&mut fs, &[0], true).remove(0);
         assert_eq!(ledger.settle(&mut fs, job.id, false), 1);
         assert_eq!(fs[0].viewed, ViewedState::Dismissed);
         assert_eq!(ledger.pending(), 0);
@@ -177,8 +203,8 @@ mod tests {
     fn failure_of_a_later_toggle_returns_to_the_earlier_confirmed_one() {
         let mut fs = files(&[ViewedState::Unviewed]);
         let mut ledger = Ledger::new(&fs);
-        let first = ledger.apply(&mut fs, &[0], true);
-        let second = ledger.apply(&mut fs, &[0], false);
+        let first = ledger.apply(&mut fs, &[0], true).remove(0);
+        let second = ledger.apply(&mut fs, &[0], false).remove(0);
         ledger.settle(&mut fs, first.id, true);
         ledger.settle(&mut fs, second.id, false);
         assert_eq!(fs[0].viewed, ViewedState::Viewed);
@@ -188,13 +214,38 @@ mod tests {
     fn failure_does_not_undo_a_newer_toggle_still_in_flight() {
         let mut fs = files(&[ViewedState::Unviewed, ViewedState::Unviewed]);
         let mut ledger = Ledger::new(&fs);
-        let dir = ledger.apply(&mut fs, &[0, 1], true);
-        let single = ledger.apply(&mut fs, &[1], false);
+        let dir = ledger.apply(&mut fs, &[0, 1], true).remove(0);
+        let single = ledger.apply(&mut fs, &[1], false).remove(0);
         // The directory job fails: f0 is rolled back, f1 belongs to `single`.
         assert_eq!(ledger.settle(&mut fs, dir.id, false), 1);
         assert_eq!(fs[0].viewed, ViewedState::Unviewed);
         assert_eq!(fs[1].viewed, ViewedState::Unviewed);
         ledger.settle(&mut fs, single.id, true);
         assert_eq!(fs[1].viewed, ViewedState::Unviewed);
+    }
+
+    #[test]
+    fn a_toggle_across_pull_requests_splits_into_one_job_each() {
+        let mut fs = files(&[
+            ViewedState::Unviewed,
+            ViewedState::Unviewed,
+            ViewedState::Unviewed,
+        ]);
+        fs[1].pr = 1;
+        let mut ledger = Ledger::new(&fs);
+        let jobs = ledger.apply(&mut fs, &[0, 1, 2], true);
+        let split: Vec<(usize, Vec<String>)> =
+            jobs.iter().map(|j| (j.pr, j.paths.clone())).collect();
+        assert_eq!(
+            split,
+            [
+                (0, vec!["f0".to_string(), "f2".to_string()]),
+                (1, vec!["f1".to_string()])
+            ]
+        );
+        // PR 1 failing leaves PR 0's files alone.
+        ledger.settle(&mut fs, jobs[1].id, false);
+        assert_eq!(fs[1].viewed, ViewedState::Unviewed);
+        assert_eq!(fs[0].viewed, ViewedState::Viewed);
     }
 }

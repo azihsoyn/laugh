@@ -124,6 +124,11 @@ impl Pane {
 /// selected thread's conversation on the left and its code on the right.
 pub struct ThreadsView {
     threads: Vec<Thread>,
+    /// `owner/repo#N`-style labels per opened PR; shown on cards and the
+    /// code pane only when there is more than one.
+    pr_labels: Vec<String>,
+    /// `None` shows every open PR's threads together; `Some(i)` just the i-th.
+    scope: Option<usize>,
     state_filter: StateFilter,
     tabs: Vec<Tab>,
     selected_tab: usize,
@@ -138,11 +143,13 @@ pub struct ThreadsView {
 }
 
 impl ThreadsView {
-    pub fn new(threads: Vec<Thread>) -> Self {
+    pub fn new(threads: Vec<Thread>, pr_labels: Vec<String>) -> Self {
         let tabs = build_tabs(&threads);
         let selected_tab = default_tab_index(&tabs);
         let mut view = ThreadsView {
             threads,
+            pr_labels,
+            scope: None,
             state_filter: StateFilter::All,
             tabs,
             selected_tab,
@@ -164,6 +171,7 @@ impl ThreadsView {
             .iter()
             .enumerate()
             .filter(|(_, t)| self.state_filter.matches(t))
+            .filter(|(_, t)| self.scope.is_none_or(|pr| t.pr == pr))
             .map(|(i, _)| i)
             .collect()
     }
@@ -259,8 +267,25 @@ impl ThreadsView {
 }
 
 impl ThreadsView {
+    /// Threads within the current scope, before any other filter.
     pub fn len(&self) -> usize {
-        self.threads.len()
+        self.threads
+            .iter()
+            .filter(|t| self.scope.is_none_or(|pr| t.pr == pr))
+            .count()
+    }
+
+    pub fn set_scope(&mut self, scope: Option<usize>) {
+        self.scope = scope;
+        self.selected = Some(0);
+        self.clamp_selection();
+        self.reset_scroll();
+    }
+
+    /// The PR a thread belongs to, when telling PRs apart matters.
+    fn pr_badge(&self, thread: &Thread) -> Option<&str> {
+        (self.pr_labels.len() > 1 && self.scope.is_none())
+            .then(|| self.pr_labels[thread.pr].as_str())
     }
 
     pub fn handle_key(&mut self, code: KeyCode) {
@@ -456,7 +481,7 @@ fn draw_cards(f: &mut ratatui::Frame<'_>, area: Rect, app: &ThreadsView) {
             Line::from(Span::styled(filename.to_string(), name_style)),
             Line::from(Span::styled(snippet_text, theme::muted())),
         ];
-        let block = Block::default()
+        let mut block = Block::default()
             .borders(Borders::ALL)
             .border_type(BorderType::Rounded)
             .border_style(if is_selected {
@@ -464,6 +489,13 @@ fn draw_cards(f: &mut ratatui::Frame<'_>, area: Rect, app: &ThreadsView) {
             } else {
                 theme::faint()
             });
+        // Which PR, on the card's top edge, so it never crowds the content.
+        if let Some(badge) = app.pr_badge(t) {
+            block = block.title(Span::styled(
+                format!(" {badge} "),
+                Style::default().fg(theme::BRAND),
+            ));
+        }
         let mut card = Paragraph::new(lines).block(block);
         if is_selected {
             card = card.style(theme::selected_row());
@@ -620,10 +652,15 @@ fn draw_code(f: &mut ratatui::Frame<'_>, area: Rect, app: &ThreadsView) {
     let [path_area, code_area] =
         Layout::vertical([Constraint::Length(2), Constraint::Min(0)]).areas(inner);
     f.render_widget(block, area);
-    f.render_widget(
-        Paragraph::new(Span::styled(location(thread), theme::faint())),
-        path_area,
-    );
+    let mut path_line = Vec::new();
+    if app.pr_labels.len() > 1 {
+        path_line.push(Span::styled(
+            format!("{}  ", app.pr_labels[thread.pr]),
+            Style::default().fg(theme::BRAND),
+        ));
+    }
+    path_line.push(Span::styled(location(thread), theme::faint()));
+    f.render_widget(Paragraph::new(Line::from(path_line)), path_area);
 
     let hunk = thread
         .starter()

@@ -12,6 +12,9 @@ pub enum ViewedState {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct PrFile {
+    /// Which of the opened pull requests this belongs to (index into them).
+    #[serde(skip)]
+    pub pr: usize,
     pub path: String,
     pub additions: u64,
     pub deletions: u64,
@@ -47,6 +50,9 @@ pub struct Comment {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct Thread {
+    /// Which of the opened pull requests this belongs to (index into them).
+    #[serde(skip)]
+    pub pr: usize,
     pub is_resolved: bool,
     pub is_outdated: bool,
     pub path: Option<String>,
