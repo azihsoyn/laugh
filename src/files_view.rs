@@ -356,6 +356,10 @@ pub struct FilesView {
     /// Reading order per opened PR, and how each was worked out.
     order: Vec<Vec<Step>>,
     order_by: Vec<OrderBy>,
+    /// prognost's `(callee, caller)` file pairs per PR, kept to reorder.
+    deps: Vec<Vec<(usize, usize)>>,
+    /// Callers before callees, code before its types: `O`.
+    top_down: bool,
     prognost: Option<Receiver<PrognostResult>>,
     diff: DiffPane,
     /// `LAUGH_OPEN_CMD`: when set, ⏎ on a file runs it instead of showing
@@ -538,7 +542,9 @@ impl FilesView {
                 // prognost ran but found no calls between the changed files
                 // (or none it can read — it's TypeScript only): still by kind.
                 Ok(Some(deps)) if !deps.is_empty() => {
-                    self.order[pr] = reading_order::order(&self.files, &indices, &deps);
+                    self.order[pr] =
+                        reading_order::order(&self.files, &indices, &deps, self.top_down);
+                    self.deps[pr] = deps;
                     self.order_by[pr] = OrderBy::Prognost;
                 }
                 Ok(_) => self.order_by[pr] = OrderBy::Kind,
@@ -550,19 +556,49 @@ impl FilesView {
         }
     }
 
-    fn order_label(&self) -> &'static str {
+    /// Flips the reading order between bottom-up and top-down, keeping the
+    /// cursor on the same file.
+    fn flip_order(&mut self) {
+        let selected = self.selected_file();
+        self.top_down = !self.top_down;
+        for (pr, indices) in files_per_pr(&self.dirs, &self.pr_roots)
+            .into_iter()
+            .enumerate()
+        {
+            self.order[pr] =
+                reading_order::order(&self.files, &indices, &self.deps[pr], self.top_down);
+        }
+        if let Some(file) = selected {
+            let at = self
+                .rows()
+                .iter()
+                .position(|r| matches!(r, RowRef::File { file: f, .. } if *f == file));
+            self.table.select(at);
+        }
+        self.clamp();
+    }
+
+    fn order_label(&self) -> String {
         let by: Vec<OrderBy> = self
             .scoped_prs()
             .iter()
             .map(|&pr| self.order_by[pr])
             .collect();
-        if by.contains(&OrderBy::Asking) {
+        let calls = by.contains(&OrderBy::Prognost);
+        let how = if by.contains(&OrderBy::Asking) {
             "by kind · asking prognost…"
-        } else if by.contains(&OrderBy::Prognost) {
+        } else if calls {
             "by calls (prognost)"
         } else {
             "by kind"
-        }
+        };
+        let direction = match (self.top_down, calls) {
+            (false, true) => "what's used first",
+            (true, true) => "callers first",
+            (false, false) => "types first",
+            (true, false) => "code first",
+        };
+        format!("{how} · {direction}")
     }
 
     fn push_contents(&self, dir: usize, rows: &mut Vec<RowRef>) {
@@ -790,9 +826,11 @@ impl FilesView {
         let (dirs, pr_roots) = build_tree(&files, pr_labels);
         let order: Vec<Vec<Step>> = files_per_pr(&dirs, &pr_roots)
             .iter()
-            .map(|indices| reading_order::order(&files, indices, &[]))
+            .map(|indices| reading_order::order(&files, indices, &[], false))
             .collect();
         let mut view = FilesView {
+            deps: vec![Vec::new(); order.len()],
+            top_down: false,
             file_dir: file_dirs(&dirs, files.len()),
             order_by: vec![OrderBy::Kind; order.len()],
             order,
@@ -1025,6 +1063,10 @@ impl FilesView {
             self.toggle_order();
             return;
         }
+        if code == KeyCode::Char('O') && self.order_mode {
+            self.flip_order();
+            return;
+        }
         if self.diff.open {
             match code {
                 KeyCode::Esc => {
@@ -1157,6 +1199,9 @@ impl FilesView {
         };
         if !self.unviewed_generated().is_empty() {
             hints.push(("m", "viewed: generated"));
+        }
+        if self.order_mode {
+            hints.push(("O", "reverse"));
         }
         hints.push(if self.order_mode {
             ("o", "tree")
@@ -1628,6 +1673,8 @@ mod tests {
             order_mode: false,
             order: Vec::new(),
             order_by: Vec::new(),
+            deps: Vec::new(),
+            top_down: false,
             prognost: None,
             diff: DiffPane::default(),
             open_cmd: None,
@@ -1736,6 +1783,8 @@ mod tests {
             order_mode: false,
             order: Vec::new(),
             order_by: Vec::new(),
+            deps: Vec::new(),
+            top_down: false,
             prognost: None,
             diff: DiffPane::default(),
             open_cmd: None,
@@ -1833,8 +1882,9 @@ mod tests {
             false,
         );
         a.file_dir = file_dirs(&a.dirs, a.files.len());
-        a.order = vec![reading_order::order(&a.files, &[0, 1, 2, 3], &[])];
+        a.order = vec![reading_order::order(&a.files, &[0, 1, 2, 3], &[], false)];
         a.order_by = vec![OrderBy::Kind];
+        a.deps = vec![Vec::new()];
         a.handle_key(KeyCode::Char('o'));
         assert!(a.order_mode);
         assert_eq!(
@@ -1843,6 +1893,14 @@ mod tests {
         );
         a.handle_key(KeyCode::Char('v')); // first row: the schema
         assert_eq!(a.files[3].viewed, ViewedState::Viewed);
+        a.handle_key(KeyCode::Char('j'));
+        a.handle_key(KeyCode::Char('O'));
+        assert_eq!(
+            row_labels(&a),
+            ["retry.ts", "retry.test.ts", "schema.sql", "README.md"]
+        );
+        assert_eq!(a.selected_file(), Some(2), "the cursor stays on retry.ts");
+        assert_eq!(a.order_label(), "by kind · code first");
         a.handle_key(KeyCode::Char('o'));
         assert!(!a.order_mode);
     }

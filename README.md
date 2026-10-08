@@ -142,8 +142,13 @@ docs, and generated files last. If [prognost](https://github.com/azihsoyn/progno
 is installed (or `LAUGH_PROGNOST` points at it) and you run laugh inside a
 checkout of the PR's repository that has both commits, laugh asks it which
 changed functions call which, and puts what's used before what uses it
-(`uses index.ts`, `used by client.ts`). The header says which order you got.
-`v`, `V` and `H` work the same in either view.
+(`uses index.ts`, `used by client.ts`).
+
+`O` turns it around, for reading from the entry points in: callers before
+what they call, or by kind, the code before its schemas and types. Tests
+still follow their code, and config, docs and generated files stay last.
+The header says which order you got and which way round. `v`, `V` and `H`
+work the same in either view.
 
 `⏎` on a file shows its diff beside the tree — GitHub's own, so it works
 without a checkout. `J` / `K` scroll it, moving the cursor follows it to the
@@ -229,6 +234,7 @@ link.
 | `H` | hide / show viewed files |
 | `m` | viewed: every generated file (asks first) |
 | `o` | reading order / tree |
+| `O` | reading order: bottom-up / top-down |
 | `/` | filter by path (text, glob or regex) |
 | `m` with a filter | viewed: every match (asks first) |
 | `⏎` on a file | its diff (or `LAUGH_OPEN_CMD`) |
