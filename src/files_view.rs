@@ -1,4 +1,6 @@
 use std::collections::{BTreeMap, HashSet};
+use std::sync::mpsc::{self, Receiver};
+use std::thread;
 
 use anyhow::{Result, bail};
 use crossterm::event::KeyCode;
@@ -8,6 +10,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Cell, Clear, HighlightSpacing, Paragraph, Row, Table, TableState};
 
 use crate::model::{PrFile, ViewedState};
+use crate::reading_order::{self, Step};
 use crate::viewed_sync::{Ledger, Outcome, Worker};
 use crate::{theme, ui};
 
@@ -133,6 +136,43 @@ enum RowRef {
     File { file: usize, dir: usize },
 }
 
+/// Where one opened PR lives and its base and head commits — what prognost
+/// needs to work out a reading order.
+pub struct PrSource {
+    pub owner: String,
+    pub repo: String,
+    pub base: String,
+    pub head: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OrderBy {
+    Kind,
+    Asking,
+    Prognost,
+}
+
+type PrognostResult = (usize, Result<Option<Vec<(usize, usize)>>, String>);
+
+/// Which directory node each file sits directly in.
+fn file_dirs(dirs: &[DirNode], count: usize) -> Vec<usize> {
+    let mut out = vec![ROOT; count];
+    for (d, node) in dirs.iter().enumerate() {
+        for &f in &node.files {
+            out[f] = d;
+        }
+    }
+    out
+}
+
+/// The files of each PR, in the order the tree's roots give them.
+fn files_per_pr(dirs: &[DirNode], pr_roots: &[usize]) -> Vec<Vec<usize>> {
+    pr_roots
+        .iter()
+        .map(|&r| dirs[r].all_files.clone())
+        .collect()
+}
+
 /// The changed-files screen: a directory tree with each file's Viewed state.
 pub struct FilesView {
     files: Vec<PrFile>,
@@ -149,6 +189,14 @@ pub struct FilesView {
     ledger: Ledger,
     /// `None` only in tests, where nothing should reach GitHub.
     worker: Option<Worker>,
+    sources: Vec<PrSource>,
+    file_dir: Vec<usize>,
+    /// Showing the reading order instead of the tree.
+    order_mode: bool,
+    /// Reading order per opened PR, and how each was worked out.
+    order: Vec<Vec<Step>>,
+    order_by: Vec<OrderBy>,
+    prognost: Option<Receiver<PrognostResult>>,
 }
 
 impl FilesView {
@@ -175,9 +223,119 @@ impl FilesView {
     }
 
     fn rows(&self) -> Vec<RowRef> {
+        if self.order_mode {
+            return self.order_rows();
+        }
         let mut rows = Vec::new();
         self.push_contents(self.view_root(), &mut rows);
         rows
+    }
+
+    /// PRs in the current scope, in order.
+    fn scoped_prs(&self) -> Vec<usize> {
+        match self.scope {
+            Some(pr) => vec![pr],
+            None => (0..self.order.len()).collect(),
+        }
+    }
+
+    fn order_rows(&self) -> Vec<RowRef> {
+        self.scoped_prs()
+            .into_iter()
+            .flat_map(|pr| self.order[pr].iter())
+            .filter(|step| self.file_visible(step.file))
+            .map(|step| RowRef::File {
+                file: step.file,
+                dir: self.file_dir[step.file],
+            })
+            .collect()
+    }
+
+    fn order_reason(&self, file: usize) -> Option<&str> {
+        self.order
+            .iter()
+            .flatten()
+            .find(|s| s.file == file)
+            .map(|s| s.reason.as_str())
+    }
+
+    /// Switches between the tree and the reading order. The first time,
+    /// asks prognost (in the background) to refine the order.
+    fn toggle_order(&mut self) {
+        self.order_mode = !self.order_mode;
+        self.table.select(Some(0));
+        self.clamp();
+        if self.order_mode && self.prognost.is_none() && !self.sources.is_empty() {
+            let (tx, rx) = mpsc::channel();
+            let files = self.files.clone();
+            let per_pr = files_per_pr(&self.dirs, &self.pr_roots);
+            let sources: Vec<(String, String, String, String)> = self
+                .sources
+                .iter()
+                .map(|s| {
+                    (
+                        s.owner.clone(),
+                        s.repo.clone(),
+                        s.base.clone(),
+                        s.head.clone(),
+                    )
+                })
+                .collect();
+            self.order_by = vec![OrderBy::Asking; self.order.len()];
+            thread::spawn(move || {
+                for (pr, (owner, repo, base, head)) in sources.into_iter().enumerate() {
+                    let result = reading_order::prognost_deps(
+                        &files,
+                        &per_pr[pr],
+                        &owner,
+                        &repo,
+                        &base,
+                        &head,
+                    )
+                    .map_err(|e| format!("{e:#}"));
+                    if tx.send((pr, result)).is_err() {
+                        break;
+                    }
+                }
+            });
+            self.prognost = Some(rx);
+        }
+    }
+
+    fn drain_prognost(&mut self) {
+        let Some(rx) = &self.prognost else { return };
+        let results: Vec<PrognostResult> = rx.try_iter().collect();
+        for (pr, result) in results {
+            let indices = files_per_pr(&self.dirs, &self.pr_roots).swap_remove(pr);
+            match result {
+                // prognost ran but found no calls between the changed files
+                // (or none it can read — it's TypeScript only): still by kind.
+                Ok(Some(deps)) if !deps.is_empty() => {
+                    self.order[pr] = reading_order::order(&self.files, &indices, &deps);
+                    self.order_by[pr] = OrderBy::Prognost;
+                }
+                Ok(_) => self.order_by[pr] = OrderBy::Kind,
+                Err(e) => {
+                    self.order_by[pr] = OrderBy::Kind;
+                    self.status = Some(format!("prognost: {e}"));
+                }
+            }
+        }
+    }
+
+    fn order_label(&self) -> &'static str {
+        let by: Vec<OrderBy> = self
+            .scoped_prs()
+            .iter()
+            .map(|&pr| self.order_by[pr])
+            .collect();
+        if by.contains(&OrderBy::Asking) {
+            "by kind · asking prognost…"
+        } else if by.contains(&OrderBy::Prognost) {
+            "by calls (prognost)"
+        } else {
+            "by kind"
+        }
     }
 
     fn push_contents(&self, dir: usize, rows: &mut Vec<RowRef>) {
@@ -200,6 +358,14 @@ impl FilesView {
     /// The same rows as `rows`, each with the tree guide (`├─ `, `│  `…)
     /// that draws its place in the hierarchy.
     fn rows_with_guides(&self) -> Vec<(RowRef, String)> {
+        if self.order_mode {
+            return self
+                .order_rows()
+                .into_iter()
+                .enumerate()
+                .map(|(n, row)| (row, format!("{:>3}  ", n + 1)))
+                .collect();
+        }
         let mut rows = Vec::new();
         self.push_guided(self.view_root(), "", true, &mut rows);
         rows
@@ -369,9 +535,24 @@ impl FilesView {
 
     /// `pr_ids` / `pr_labels` are per opened pull request; each file's `pr`
     /// indexes into them.
-    pub fn new(pr_ids: Vec<String>, pr_labels: &[String], files: Vec<PrFile>) -> Self {
+    pub fn new(
+        pr_ids: Vec<String>,
+        pr_labels: &[String],
+        sources: Vec<PrSource>,
+        files: Vec<PrFile>,
+    ) -> Self {
         let (dirs, pr_roots) = build_tree(&files, pr_labels);
+        let order: Vec<Vec<Step>> = files_per_pr(&dirs, &pr_roots)
+            .iter()
+            .map(|indices| reading_order::order(&files, indices, &[]))
+            .collect();
         let mut view = FilesView {
+            file_dir: file_dirs(&dirs, files.len()),
+            order_by: vec![OrderBy::Kind; order.len()],
+            order,
+            order_mode: false,
+            prognost: None,
+            sources,
             dirs,
             pr_roots,
             scope: None,
@@ -391,6 +572,7 @@ impl FilesView {
     /// Picks up finished background writes; call once per frame.
     pub fn tick(&mut self) {
         self.drain_outcomes();
+        self.drain_prognost();
     }
 
     /// Generated files in scope that aren't viewed yet.
@@ -446,6 +628,10 @@ impl FilesView {
         }
         if code == KeyCode::Char('m') {
             self.ask_to_mark_generated();
+            return;
+        }
+        if code == KeyCode::Char('o') {
+            self.toggle_order();
             return;
         }
         let Some(current) = self.current() else {
@@ -533,6 +719,11 @@ impl FilesView {
         if !self.unviewed_generated().is_empty() {
             hints.push(("m", "viewed: generated"));
         }
+        hints.push(if self.order_mode {
+            ("o", "tree")
+        } else {
+            ("o", "reading order")
+        });
         hints
     }
 
@@ -643,6 +834,14 @@ fn draw(f: &mut ratatui::Frame<'_>, area: Rect, app: &mut FilesView) {
         summary.push(Span::raw("   "));
         summary.push(Span::styled(" hiding viewed ", theme::pill_on()));
     }
+    if app.order_mode {
+        summary.push(Span::raw("   "));
+        summary.push(Span::styled(" reading order ", theme::pill_on()));
+        summary.push(Span::styled(
+            format!(" {}", app.order_label()),
+            theme::muted(),
+        ));
+    }
     f.render_widget(Paragraph::new(Line::from(summary)), summary_area);
 
     // Pad both sides of `done/total` to the widest total any directory row
@@ -707,9 +906,21 @@ fn draw(f: &mut ratatui::Frame<'_>, area: Rect, app: &mut FilesView) {
                             guide,
                             viewed_icon(pf.viewed),
                             Span::raw(" "),
-                            Span::styled(pf.file_name().to_string(), name_style),
                             Span::styled(
-                                pf.generated.map_or(String::new(), |why| format!("  {why}")),
+                                if app.order_mode {
+                                    pf.path.clone()
+                                } else {
+                                    pf.file_name().to_string()
+                                },
+                                name_style,
+                            ),
+                            Span::styled(
+                                if app.order_mode {
+                                    app.order_reason(file)
+                                        .map_or(String::new(), |r| format!("  {r}"))
+                                } else {
+                                    pf.generated.map_or(String::new(), |why| format!("  {why}"))
+                                },
                                 theme::faint(),
                             ),
                         ])),
@@ -852,6 +1063,12 @@ mod tests {
             status: None,
             confirm: None,
             worker: None,
+            sources: Vec::new(),
+            file_dir: Vec::new(),
+            order_mode: false,
+            order: Vec::new(),
+            order_by: Vec::new(),
+            prognost: None,
         }
     }
 
@@ -936,6 +1153,12 @@ mod tests {
             status: None,
             confirm: None,
             worker: None,
+            sources: Vec::new(),
+            file_dir: Vec::new(),
+            order_mode: false,
+            order: Vec::new(),
+            order_by: Vec::new(),
+            prognost: None,
         }
     }
 
@@ -1007,5 +1230,31 @@ mod tests {
         a.handle_key(KeyCode::Char('H'));
         assert!(a.is_modal() && !a.hide_viewed);
         assert_eq!(a.files[0].viewed, ViewedState::Unviewed);
+    }
+
+    #[test]
+    fn o_lists_files_in_reading_order_and_keeps_v_working() {
+        let mut a = app(
+            files(&[
+                "src/__tests__/retry.test.ts",
+                "README.md",
+                "src/retry.ts",
+                "db/schema.sql",
+            ]),
+            false,
+        );
+        a.file_dir = file_dirs(&a.dirs, a.files.len());
+        a.order = vec![reading_order::order(&a.files, &[0, 1, 2, 3], &[])];
+        a.order_by = vec![OrderBy::Kind];
+        a.handle_key(KeyCode::Char('o'));
+        assert!(a.order_mode);
+        assert_eq!(
+            row_labels(&a),
+            ["schema.sql", "retry.ts", "retry.test.ts", "README.md"]
+        );
+        a.handle_key(KeyCode::Char('v')); // first row: the schema
+        assert_eq!(a.files[3].viewed, ViewedState::Viewed);
+        a.handle_key(KeyCode::Char('o'));
+        assert!(!a.order_mode);
     }
 }
