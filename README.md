@@ -49,12 +49,15 @@ brew install azihsoyn/tap/laugh                            # Homebrew (macOS/Lin
 cargo install laugh                                        # or build it (Rust 1.88+)
 ```
 
-Or the prebuilt binary for macOS, Linux or Windows, from the
-[latest release](https://github.com/azihsoyn/laugh/releases/latest):
+Or the prebuilt binary, on macOS or Linux with the installer script:
 
 ```sh
 curl --proto '=https' --tlsv1.2 -LsSf https://github.com/azihsoyn/laugh/releases/latest/download/laugh-installer.sh | sh
 ```
+
+On Windows, download `laugh-x86_64-pc-windows-msvc.zip` from the
+[latest release](https://github.com/azihsoyn/laugh/releases/latest) and put
+`laugh.exe` on your `PATH`.
 
 laugh needs the [GitHub CLI](https://cli.github.com) (`gh`) on your `PATH`,
 logged in with `gh auth login` — it uses those credentials and configures
