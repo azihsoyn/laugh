@@ -215,6 +215,7 @@ link.
 | | |
 |---|---|
 | `1` `2` `3` | Files / Threads / Checks |
+| `tab` `shift-tab` | next / previous screen |
 | `[` `]` | All PRs, or one at a time |
 | `?` | every key |
 | `q` | quit (after anything still being saved) |
@@ -238,7 +239,7 @@ link.
 | `h` `l` · `g` `G` | previous / next thread · first / last |
 | `j` `k` · `J` `K` | scroll · scroll faster |
 | `space` | scroll the thread or the code |
-| `tab` `shift-tab` | next / previous person |
+| `p` `P` | next / previous person |
 | `a` | hand the thread to your agent |
 | `r` | hide / show resolved |
 | `f` | open → resolved → outdated → all |

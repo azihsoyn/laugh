@@ -14,11 +14,21 @@ use crate::term::{self, Term, with_terminal};
 use crate::threads_view::ThreadsView;
 use crate::{theme, ui};
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Screen {
     Files,
     Threads,
     Checks,
+}
+
+impl Screen {
+    const ALL: [Screen; 3] = [Screen::Files, Screen::Threads, Screen::Checks];
+
+    /// The screen `delta` along from this one, wrapping around.
+    fn step(self, delta: i32) -> Screen {
+        let i = Screen::ALL.iter().position(|&s| s == self).unwrap_or(0) as i32;
+        Screen::ALL[(i + delta).rem_euclid(Screen::ALL.len() as i32) as usize]
+    }
 }
 
 pub struct PrHeader {
@@ -146,6 +156,8 @@ fn event_loop(terminal: &mut Term, app: &mut PrApp) -> Result<()> {
             KeyCode::Char('1') => app.screen = Screen::Files,
             KeyCode::Char('2') => app.screen = Screen::Threads,
             KeyCode::Char('3') => app.screen = Screen::Checks,
+            KeyCode::Tab => app.screen = app.screen.step(1),
+            KeyCode::BackTab => app.screen = app.screen.step(-1),
             KeyCode::Char(']') => app.cycle_scope(1),
             KeyCode::Char('[') => app.cycle_scope(-1),
             code => match app.screen {
@@ -421,6 +433,7 @@ const HELP: &[(&str, &[(&str, &str)])] = &[
         "Anywhere",
         &[
             ("1 2 3", "files / threads / checks"),
+            ("tab  ⇧tab", "next / previous screen"),
             ("[  ]", "all PRs / one PR at a time"),
             ("?", "this list"),
             ("q", "quit (waits for pending saves)"),
@@ -449,7 +462,7 @@ const HELP: &[(&str, &[(&str, &str)])] = &[
             ("h  l", "previous / next thread"),
             ("j  k", "scroll"),
             ("space", "scroll the thread or the code"),
-            ("tab", "next person"),
+            ("p  P", "next / previous person"),
             ("a", "send the thread to your agent"),
             ("r", "hide / show resolved"),
             ("f", "open → resolved → outdated → all"),
@@ -501,5 +514,12 @@ mod tests {
         assert!(tab_at(&hits, Position::new(20, 1)) == Some(Screen::Threads));
         assert!(tab_at(&hits, Position::new(15, 1)).is_none());
         assert!(tab_at(&hits, Position::new(20, 2)).is_none());
+    }
+
+    #[test]
+    fn tab_steps_through_the_screens_and_wraps() {
+        assert_eq!(Screen::Files.step(1), Screen::Threads);
+        assert_eq!(Screen::Checks.step(1), Screen::Files);
+        assert_eq!(Screen::Files.step(-1), Screen::Checks);
     }
 }

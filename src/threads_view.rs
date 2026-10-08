@@ -329,8 +329,8 @@ impl ThreadsView {
                 self.selected = len.checked_sub(1);
                 self.reset_scroll();
             }
-            KeyCode::Tab => self.switch_tab(1),
-            KeyCode::BackTab => self.switch_tab(-1),
+            KeyCode::Char('p') => self.switch_tab(1),
+            KeyCode::Char('P') => self.switch_tab(-1),
             KeyCode::Char(' ') | KeyCode::Enter => self.focus = self.focus.toggled(),
             KeyCode::Char('f') => {
                 self.state_filter = self.state_filter.cycle();
@@ -355,7 +355,7 @@ impl ThreadsView {
             ("←→", "thread"),
             ("↑↓", "scroll"),
             ("space", "code ⇄ thread"),
-            ("tab", "person"),
+            ("p P", "person"),
             ("a", "to agent"),
             resolved,
         ]
