@@ -18,13 +18,15 @@ use clap::{Args, CommandFactory, FromArgMatches, Parser, Subcommand};
 use model::{PrFile, Thread};
 use serde::Serialize;
 
-/// Review pull requests in the terminal: every review thread, resolved ones
-/// included, and the changed files with GitHub's own Viewed checkboxes — for
-/// one PR or a related set across repositories.
+/// Your code, your agent and your review — in the same terminal.
+///
+/// Review pull requests without opening a browser: every review thread,
+/// resolved ones included, and the changed files with GitHub's own Viewed
+/// checkboxes — for one PR or a related set across repositories.
 ///
 /// `laugh <pr>` with no subcommand is `laugh pr <pr>`.
 #[derive(Parser, Debug)]
-#[command(name = "laugh", version, about)]
+#[command(name = "laugh", version)]
 struct Cli {
     #[command(subcommand)]
     command: Command,
