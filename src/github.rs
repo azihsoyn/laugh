@@ -231,6 +231,7 @@ query($owner: String!, $repo: String!, $pr: Int!, $after: String) {
       id
       title
       url
+      baseRefOid
       headRefOid
       headRepository { nameWithOwner }
       files(first: 100, after: $after) {
@@ -247,6 +248,8 @@ struct FilesPullRequest {
     id: String,
     title: String,
     url: String,
+    #[serde(rename = "baseRefOid")]
+    base_oid: String,
     #[serde(rename = "headRefOid")]
     head_oid: String,
     #[serde(rename = "headRepository")]
@@ -277,13 +280,14 @@ pub struct PullRequestFiles {
     /// Where the PR's head lives — a fork's, for PRs from forks — and its
     /// commit, for reading files as of the PR.
     pub head_repo: Option<String>,
+    pub base_oid: String,
     pub head_oid: String,
     pub files: Vec<PrFile>,
 }
 
 pub fn fetch_files(owner: &str, repo: &str, pr: u64) -> Result<PullRequestFiles> {
     let mut files = Vec::new();
-    let mut head: Option<(String, String, String, Option<String>, String)> = None;
+    let mut head: Option<(String, String, String, Option<String>, String, String)> = None;
     let mut after: Option<String> = None;
 
     loop {
@@ -296,6 +300,7 @@ pub fn fetch_files(owner: &str, repo: &str, pr: u64) -> Result<PullRequestFiles>
                 pull_request.title,
                 pull_request.url,
                 pull_request.head_repository.map(|r| r.name_with_owner),
+                pull_request.base_oid,
                 pull_request.head_oid,
             ));
         }
@@ -314,12 +319,14 @@ pub fn fetch_files(owner: &str, repo: &str, pr: u64) -> Result<PullRequestFiles>
         after = page.page_info.end_cursor;
     }
 
-    let (id, title, url, head_repo, head_oid) = head.context("PR response never returned an id")?;
+    let (id, title, url, head_repo, base_oid, head_oid) =
+        head.context("PR response never returned an id")?;
     Ok(PullRequestFiles {
         id,
         title,
         url,
         head_repo,
+        base_oid,
         head_oid,
         files,
     })

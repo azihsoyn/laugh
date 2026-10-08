@@ -112,6 +112,16 @@ output, and anything the repository marks `linguist-generated` in its
 `.gitattributes` (what GitHub itself collapses) — are labelled with why.
 `m` marks all of them viewed at once, after showing you the list and asking.
 
+`o` switches the tree for a **reading order**: one numbered list, each file
+with why it's where it is. By default that's by kind — schemas and types
+first, then the code, each test right after what it tests, then config,
+docs, and generated files last. If [prognost](https://github.com/azihsoyn/prognost)
+is installed (or `LAUGH_PROGNOST` points at it) and you run laugh inside a
+checkout of the PR's repository that has both commits, laugh asks it which
+changed functions call which, and puts what's used before what uses it
+(`uses index.ts`, `used by client.ts`). The header says which order you got.
+`v`, `V` and `H` work the same in either view.
+
 ### 2 · Threads
 
 Every review thread — open, resolved and outdated — as a row of cards. The
@@ -176,6 +186,7 @@ link.
 | `V` | viewed: everything in this directory, or this PR |
 | `H` | hide / show viewed files |
 | `m` | viewed: every generated file (asks first) |
+| `o` | reading order / tree |
 
 | Threads | |
 |---|---|

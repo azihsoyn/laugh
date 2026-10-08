@@ -8,6 +8,7 @@ mod handoff;
 mod logo;
 mod model;
 mod pr_app;
+mod reading_order;
 mod term;
 mod theme;
 mod threads_view;
@@ -288,6 +289,7 @@ fn run_pr(args: PrArgs) -> Result<()> {
     let labels = short_labels(&refs);
     let mut headers = Vec::new();
     let mut pr_ids = Vec::new();
+    let mut sources = Vec::new();
     let mut files = Vec::new();
     let mut threads = Vec::new();
     let mut checks = Vec::new();
@@ -297,6 +299,12 @@ fn run_pr(args: PrArgs) -> Result<()> {
             c
         }));
         pr_ids.push(f.files.id);
+        sources.push(files_view::PrSource {
+            owner: r.owner.clone(),
+            repo: r.repo.clone(),
+            base: f.files.base_oid,
+            head: f.files.head_oid,
+        });
         files.extend(f.files.files.into_iter().map(|mut file| {
             file.pr = i;
             file
@@ -315,7 +323,7 @@ fn run_pr(args: PrArgs) -> Result<()> {
 
     pr_app::run(
         headers,
-        files_view::FilesView::new(pr_ids, &labels, files),
+        files_view::FilesView::new(pr_ids, &labels, sources, files),
         threads_view::ThreadsView::new(
             threads,
             labels.clone(),
