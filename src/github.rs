@@ -170,6 +170,7 @@ struct RawAuthor {
 impl From<RawThread> for Thread {
     fn from(raw: RawThread) -> Self {
         Thread {
+            pr: 0,
             is_resolved: raw.is_resolved,
             is_outdated: raw.is_outdated,
             path: raw.path,
@@ -277,6 +278,7 @@ pub fn fetch_files(owner: &str, repo: &str, pr: u64) -> Result<PullRequestFiles>
         }
         let page = pull_request.files;
         files.extend(page.nodes.into_iter().map(|f| PrFile {
+            pr: 0,
             path: f.path,
             additions: f.additions,
             deletions: f.deletions,

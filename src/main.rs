@@ -30,17 +30,21 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Command {
-    /// Open a pull request: changed files with their Viewed state, and every
-    /// review thread (resolved and outdated included). Switch with 1 / 2.
+    /// Open one or more pull requests: changed files with their Viewed state,
+    /// and every review thread (resolved and outdated included). Switch
+    /// screens with 1 / 2; with several PRs, [ / ] steps between all of
+    /// them together and one at a time.
     Pr(PrArgs),
 }
 
 #[derive(Args, Debug)]
 struct PrArgs {
-    /// PR number (e.g. 123) or a full https://github.com/owner/repo/pull/123 URL
-    pr: String,
+    /// One or more PRs: 123, owner/repo#123, or https://github.com/owner/repo/pull/123.
+    /// Bare numbers use --repo, or the current directory's repository.
+    #[arg(required = true, num_args = 1..)]
+    prs: Vec<String>,
 
-    /// owner/repo to query; inferred from the current directory's git remote if omitted
+    /// owner/repo for bare PR numbers; inferred from the current directory's git remote if omitted
     #[arg(long)]
     repo: Option<String>,
 
@@ -49,6 +53,7 @@ struct PrArgs {
     json: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct PrRef {
     owner: String,
     repo: String,
@@ -56,26 +61,39 @@ struct PrRef {
 }
 
 impl PrRef {
-    fn label(&self) -> String {
+    fn full(&self) -> String {
         format!("{}/{}#{}", self.owner, self.repo, self.number)
     }
 }
 
-fn parse_pr_ref(args: &PrArgs) -> Result<PrRef> {
-    let pr_arg = args.pr.as_str();
+fn split_repo(r: &str) -> Option<(String, String)> {
+    let (owner, name) = r.split_once('/')?;
+    (!owner.is_empty() && !name.is_empty() && !name.contains('/'))
+        .then(|| (owner.to_string(), name.to_string()))
+}
+
+/// Parses one PR argument. `default_repo` is only consulted for bare numbers,
+/// so the current directory needn't be a repository when every PR is spelled
+/// out in full.
+fn parse_pr_ref(
+    arg: &str,
+    default_repo: &mut dyn FnMut() -> Result<(String, String)>,
+) -> Result<PrRef> {
     for prefix in ["https://github.com/", "http://github.com/"] {
-        if let Some(rest) = pr_arg.strip_prefix(prefix) {
+        if let Some(rest) = arg.strip_prefix(prefix) {
+            // Links copied from GitHub often carry `#discussion_r…` or `?w=1`.
+            let rest = rest.split(['#', '?']).next().unwrap_or(rest);
             let parts: Vec<&str> = rest.trim_end_matches('/').split('/').collect();
             let pull_idx = parts
                 .iter()
                 .position(|s| *s == "pull")
-                .with_context(|| format!("not a PR URL: {pr_arg}"))?;
-            anyhow::ensure!(pull_idx >= 2, "not a PR URL: {pr_arg}");
+                .with_context(|| format!("not a PR URL: {arg}"))?;
+            anyhow::ensure!(pull_idx >= 2, "not a PR URL: {arg}");
             let number: u64 = parts
                 .get(pull_idx + 1)
-                .with_context(|| format!("not a PR URL: {pr_arg}"))?
+                .with_context(|| format!("not a PR URL: {arg}"))?
                 .parse()
-                .with_context(|| format!("not a PR URL: {pr_arg}"))?;
+                .with_context(|| format!("not a PR URL: {arg}"))?;
             return Ok(PrRef {
                 owner: parts[0].to_string(),
                 repo: parts[1].to_string(),
@@ -84,24 +102,51 @@ fn parse_pr_ref(args: &PrArgs) -> Result<PrRef> {
         }
     }
 
-    let number: u64 = pr_arg
+    if let Some((repo, number)) = arg.rsplit_once('#')
+        && !repo.is_empty()
+    {
+        let (owner, repo) =
+            split_repo(repo).with_context(|| format!("expected owner/repo#123, got: {arg}"))?;
+        let number = number
+            .parse()
+            .with_context(|| format!("expected owner/repo#123, got: {arg}"))?;
+        return Ok(PrRef {
+            owner,
+            repo,
+            number,
+        });
+    }
+
+    let number: u64 = arg
         .trim_start_matches('#')
         .parse()
-        .context("PR must be a number (123) or a https://github.com/owner/repo/pull/123 URL")?;
-
-    let (owner, repo) = match args.repo.as_deref() {
-        Some(r) => r
-            .split_once('/')
-            .map(|(o, n)| (o.to_string(), n.to_string()))
-            .with_context(|| format!("--repo must look like owner/name, got: {r}"))?,
-        None => github::infer_repo()?,
-    };
-
+        .with_context(|| format!("not a PR: {arg} (use 123, owner/repo#123, or a PR URL)"))?;
+    let (owner, repo) = default_repo()?;
     Ok(PrRef {
         owner,
         repo,
         number,
     })
+}
+
+/// Short switcher labels: `repo#N`, widened to `owner/repo#N` only where two
+/// PRs come from same-named repositories under different owners.
+fn short_labels(refs: &[PrRef]) -> Vec<String> {
+    refs.iter()
+        .map(|r| {
+            let ambiguous = refs.iter().any(|o| o.repo == r.repo && o.owner != r.owner);
+            if ambiguous {
+                r.full()
+            } else {
+                format!("{}#{}", r.repo, r.number)
+            }
+        })
+        .collect()
+}
+
+#[derive(Serialize)]
+struct Output<'a> {
+    prs: Vec<PrJson<'a>>,
 }
 
 #[derive(Serialize)]
@@ -120,46 +165,120 @@ struct PrMetaJson<'a> {
     url: &'a str,
 }
 
-fn run_pr(args: PrArgs) -> Result<()> {
-    let pr_ref = parse_pr_ref(&args)?;
+struct Fetched {
+    files: github::PullRequestFiles,
+    threads: github::PullRequestThreads,
+}
 
-    // Two independent GraphQL calls; fetch them side by side.
-    let (files, threads) = thread::scope(|s| {
-        let files = s.spawn(|| github::fetch_files(&pr_ref.owner, &pr_ref.repo, pr_ref.number));
-        let threads = s.spawn(|| github::fetch_threads(&pr_ref.owner, &pr_ref.repo, pr_ref.number));
-        (
-            files.join().map_err(|_| anyhow!("file fetch panicked")),
-            threads.join().map_err(|_| anyhow!("thread fetch panicked")),
-        )
+fn fetch_all(refs: &[PrRef]) -> Result<Vec<Fetched>> {
+    // Every PR's files and threads are independent calls; run them all at once.
+    let results: Vec<_> = thread::scope(|s| {
+        let handles: Vec<_> = refs
+            .iter()
+            .map(|r| {
+                (
+                    s.spawn(|| github::fetch_files(&r.owner, &r.repo, r.number)),
+                    s.spawn(|| github::fetch_threads(&r.owner, &r.repo, r.number)),
+                )
+            })
+            .collect();
+        handles
+            .into_iter()
+            .map(|(f, t)| {
+                (
+                    f.join().map_err(|_| anyhow!("file fetch panicked")),
+                    t.join().map_err(|_| anyhow!("thread fetch panicked")),
+                )
+            })
+            .collect()
     });
-    let files = files?.with_context(|| format!("fetching changed files for {}", pr_ref.label()))?;
-    let threads =
-        threads?.with_context(|| format!("fetching review threads for {}", pr_ref.label()))?;
+    results
+        .into_iter()
+        .zip(refs)
+        .map(|((files, threads), r)| {
+            Ok(Fetched {
+                files: files?
+                    .with_context(|| format!("fetching changed files for {}", r.full()))?,
+                threads: threads?
+                    .with_context(|| format!("fetching review threads for {}", r.full()))?,
+            })
+        })
+        .collect()
+}
+
+fn run_pr(args: PrArgs) -> Result<()> {
+    let mut inferred: Option<(String, String)> = None;
+    let mut default_repo = || -> Result<(String, String)> {
+        if let Some(r) = &inferred {
+            return Ok(r.clone());
+        }
+        let r = match args.repo.as_deref() {
+            Some(r) => split_repo(r)
+                .with_context(|| format!("--repo must look like owner/name, got: {r}"))?,
+            None => github::infer_repo()?,
+        };
+        inferred = Some(r.clone());
+        Ok(r)
+    };
+    let mut refs: Vec<PrRef> = Vec::new();
+    for arg in &args.prs {
+        let r = parse_pr_ref(arg, &mut default_repo)?;
+        if !refs.contains(&r) {
+            refs.push(r);
+        }
+    }
+
+    let fetched = fetch_all(&refs)?;
 
     if args.json {
-        let output = PrJson {
-            pr: PrMetaJson {
-                owner: &pr_ref.owner,
-                repo: &pr_ref.repo,
-                number: pr_ref.number,
-                title: &files.title,
-                url: &files.url,
-            },
-            files: &files.files,
-            threads: &threads.threads,
+        let output = Output {
+            prs: fetched
+                .iter()
+                .zip(&refs)
+                .map(|(f, r)| PrJson {
+                    pr: PrMetaJson {
+                        owner: &r.owner,
+                        repo: &r.repo,
+                        number: r.number,
+                        title: &f.files.title,
+                        url: &f.files.url,
+                    },
+                    files: &f.files.files,
+                    threads: &f.threads.threads,
+                })
+                .collect(),
         };
         println!("{}", serde_json::to_string_pretty(&output)?);
         return Ok(());
     }
 
+    let labels = short_labels(&refs);
+    let mut headers = Vec::new();
+    let mut pr_ids = Vec::new();
+    let mut files = Vec::new();
+    let mut threads = Vec::new();
+    for (i, (f, r)) in fetched.into_iter().zip(&refs).enumerate() {
+        pr_ids.push(f.files.id);
+        files.extend(f.files.files.into_iter().map(|mut file| {
+            file.pr = i;
+            file
+        }));
+        threads.extend(f.threads.threads.into_iter().map(|mut t| {
+            t.pr = i;
+            t
+        }));
+        headers.push(pr_app::PrHeader {
+            repo: format!("{}/{}", r.owner, r.repo),
+            number: r.number,
+            title: f.files.title,
+            label: labels[i].clone(),
+        });
+    }
+
     pr_app::run(
-        pr_app::PrHeader {
-            repo: format!("{}/{}", pr_ref.owner, pr_ref.repo),
-            number: pr_ref.number,
-            title: files.title,
-        },
-        files_view::FilesView::new(files.id, files.files),
-        threads_view::ThreadsView::new(threads.threads),
+        headers,
+        files_view::FilesView::new(pr_ids, &labels, files),
+        threads_view::ThreadsView::new(threads, labels),
     )
 }
 
@@ -212,5 +331,61 @@ mod tests {
         assert_eq!(parsed(&["laugh", "pr", "1"]), ["laugh", "pr", "1"]);
         assert_eq!(parsed(&["laugh", "--help"]), ["laugh", "--help"]);
         assert_eq!(parsed(&["laugh"]), ["laugh"]);
+    }
+
+    fn parse(arg: &str) -> Result<PrRef> {
+        parse_pr_ref(arg, &mut || Ok(("me".to_string(), "here".to_string())))
+    }
+
+    fn pr(owner: &str, repo: &str, number: u64) -> PrRef {
+        PrRef {
+            owner: owner.into(),
+            repo: repo.into(),
+            number,
+        }
+    }
+
+    #[test]
+    fn pr_arguments_in_every_spelling() {
+        assert_eq!(parse("12").unwrap(), pr("me", "here", 12));
+        assert_eq!(parse("#12").unwrap(), pr("me", "here", 12));
+        assert_eq!(parse("acme/infra#45").unwrap(), pr("acme", "infra", 45));
+        assert_eq!(
+            parse("https://github.com/acme/design/pull/67/files").unwrap(),
+            pr("acme", "design", 67)
+        );
+        assert_eq!(
+            parse("https://github.com/acme/app/pull/12#discussion_r123").unwrap(),
+            pr("acme", "app", 12)
+        );
+        assert_eq!(
+            parse("https://github.com/acme/app/pull/12/files?w=1").unwrap(),
+            pr("acme", "app", 12)
+        );
+        assert!(parse("acme#4").is_err());
+        assert!(parse("acme/infra#x").is_err());
+    }
+
+    #[test]
+    fn full_spellings_never_ask_for_the_current_repo() {
+        let mut asked = false;
+        let r = parse_pr_ref("acme/infra#45", &mut || {
+            asked = true;
+            Ok(("me".into(), "here".into()))
+        });
+        assert!(r.is_ok() && !asked);
+    }
+
+    #[test]
+    fn labels_stay_short_unless_repo_names_collide() {
+        let refs = [
+            pr("acme", "app", 1),
+            pr("acme", "infra", 2),
+            pr("other", "app", 3),
+        ];
+        assert_eq!(
+            short_labels(&refs),
+            ["acme/app#1", "infra#2", "other/app#3"]
+        );
     }
 }
