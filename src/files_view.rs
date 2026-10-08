@@ -1,5 +1,5 @@
-use std::collections::{BTreeMap, HashSet};
-use std::sync::mpsc::{self, Receiver};
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
 
 use anyhow::{Result, bail};
@@ -8,6 +8,8 @@ use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Cell, Clear, HighlightSpacing, Paragraph, Row, Table, TableState};
+
+use crate::github;
 
 use crate::model::{PrFile, ViewedState};
 use crate::reading_order::{self, Step};
@@ -141,8 +143,55 @@ enum RowRef {
 pub struct PrSource {
     pub owner: String,
     pub repo: String,
+    pub number: u64,
     pub base: String,
     pub head: String,
+}
+
+/// A file to hand to `LAUGH_OPEN_CMD`, picked up by the app loop, which
+/// gives the command the terminal while it runs.
+pub struct OpenRequest {
+    pub path: String,
+    pub owner: String,
+    pub repo: String,
+    pub number: u64,
+    pub base: String,
+    pub head: String,
+}
+
+/// One PR's diffs, by path, as GitHub serves them.
+enum Patches {
+    Loading,
+    Loaded(HashMap<String, Option<String>>),
+    Failed(String),
+}
+
+type PatchResult = (usize, Result<HashMap<String, Option<String>>, String>);
+
+/// The diff shown beside the tree: the selected file's patch, fetched per
+/// PR the first time it's needed.
+struct DiffPane {
+    open: bool,
+    scroll: u16,
+    /// The file the scroll position belongs to.
+    file: Option<usize>,
+    patches: HashMap<usize, Patches>,
+    tx: Sender<PatchResult>,
+    rx: Receiver<PatchResult>,
+}
+
+impl Default for DiffPane {
+    fn default() -> Self {
+        let (tx, rx) = mpsc::channel();
+        DiffPane {
+            open: false,
+            scroll: 0,
+            file: None,
+            patches: HashMap::new(),
+            tx,
+            rx,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -197,6 +246,11 @@ pub struct FilesView {
     order: Vec<Vec<Step>>,
     order_by: Vec<OrderBy>,
     prognost: Option<Receiver<PrognostResult>>,
+    diff: DiffPane,
+    /// `LAUGH_OPEN_CMD`: when set, ⏎ on a file runs it instead of showing
+    /// the diff here.
+    open_cmd: Option<String>,
+    open_request: Option<OpenRequest>,
 }
 
 impl FilesView {
@@ -552,6 +606,11 @@ impl FilesView {
             order,
             order_mode: false,
             prognost: None,
+            diff: DiffPane::default(),
+            open_cmd: std::env::var("LAUGH_OPEN_CMD")
+                .ok()
+                .filter(|c| !c.trim().is_empty()),
+            open_request: None,
             sources,
             dirs,
             pr_roots,
@@ -573,6 +632,83 @@ impl FilesView {
     pub fn tick(&mut self) {
         self.drain_outcomes();
         self.drain_prognost();
+        self.drain_patches();
+    }
+
+    fn selected_file(&self) -> Option<usize> {
+        match self.current()? {
+            RowRef::File { file, .. } => Some(file),
+            RowRef::Dir(_) => None,
+        }
+    }
+
+    /// Collects fetched diffs, and starts fetching the selected file's PR's
+    /// if the diff pane needs it.
+    fn drain_patches(&mut self) {
+        for (pr, result) in self.diff.rx.try_iter() {
+            let state = match result {
+                Ok(map) => Patches::Loaded(map),
+                Err(e) => Patches::Failed(e),
+            };
+            self.diff.patches.insert(pr, state);
+        }
+        if !self.diff.open {
+            return;
+        }
+        let Some(file) = self.selected_file() else {
+            return;
+        };
+        let pr = self.files[file].pr;
+        if self.diff.patches.contains_key(&pr) {
+            return;
+        }
+        let Some(source) = self.sources.get(pr) else {
+            return;
+        };
+        self.diff.patches.insert(pr, Patches::Loading);
+        let (owner, repo, number) = (source.owner.clone(), source.repo.clone(), source.number);
+        let tx = self.diff.tx.clone();
+        thread::spawn(move || {
+            let result = github::fetch_patches(&owner, &repo, number).map_err(|e| format!("{e:#}"));
+            let _ = tx.send((pr, result));
+        });
+    }
+
+    /// True while Esc should close the diff rather than quit.
+    pub fn takes_esc(&self) -> bool {
+        self.diff.open
+    }
+
+    /// A file waiting to be opened with `LAUGH_OPEN_CMD`.
+    pub fn take_open_request(&mut self) -> Option<OpenRequest> {
+        self.open_request.take()
+    }
+
+    pub fn open_cmd(&self) -> Option<&str> {
+        self.open_cmd.as_deref()
+    }
+
+    pub fn set_status(&mut self, status: String) {
+        self.status = Some(status);
+    }
+
+    fn open_file(&mut self, file: usize) {
+        if self.open_cmd.is_none() {
+            self.diff.open = !self.diff.open;
+            return;
+        }
+        let pf = &self.files[file];
+        let Some(source) = self.sources.get(pf.pr) else {
+            return;
+        };
+        self.open_request = Some(OpenRequest {
+            path: pf.path.clone(),
+            owner: source.owner.clone(),
+            repo: source.repo.clone(),
+            number: source.number,
+            base: source.base.clone(),
+            head: source.head.clone(),
+        });
     }
 
     /// Generated files in scope that aren't viewed yet.
@@ -634,6 +770,23 @@ impl FilesView {
             self.toggle_order();
             return;
         }
+        if self.diff.open {
+            match code {
+                KeyCode::Esc => {
+                    self.diff.open = false;
+                    return;
+                }
+                KeyCode::Char('J') | KeyCode::PageDown => {
+                    self.diff.scroll = self.diff.scroll.saturating_add(10);
+                    return;
+                }
+                KeyCode::Char('K') | KeyCode::PageUp => {
+                    self.diff.scroll = self.diff.scroll.saturating_sub(10);
+                    return;
+                }
+                _ => {}
+            }
+        }
         let Some(current) = self.current() else {
             if code == KeyCode::Char('H') {
                 self.hide_viewed = !self.hide_viewed;
@@ -679,9 +832,7 @@ impl FilesView {
                         self.collapsed.insert(d);
                     }
                 }
-                RowRef::File { .. } => {
-                    self.status = Some("opening a file isn't wired up yet".to_string());
-                }
+                RowRef::File { file, .. } => self.open_file(file),
             },
             KeyCode::Char('l') | KeyCode::Right => {
                 if let RowRef::Dir(d) = current {
@@ -713,7 +864,24 @@ impl FilesView {
         }
         let mut hints = match self.current() {
             Some(RowRef::Dir(_)) => vec![("V", "viewed: everything inside"), ("⏎", "fold"), hide],
-            Some(RowRef::File { .. }) => vec![("v", "viewed"), ("V", "whole folder"), hide],
+            Some(RowRef::File { .. }) if self.diff.open => {
+                vec![
+                    ("v", "viewed"),
+                    ("J K", "scroll the diff"),
+                    ("esc", "close"),
+                    hide,
+                ]
+            }
+            Some(RowRef::File { .. }) => vec![
+                ("v", "viewed"),
+                ("V", "whole folder"),
+                if self.open_cmd.is_some() {
+                    ("⏎", "open")
+                } else {
+                    ("⏎", "diff")
+                },
+                hide,
+            ],
             None => vec![hide],
         };
         if !self.unviewed_generated().is_empty() {
@@ -806,6 +974,64 @@ fn draw_confirm(f: &mut ratatui::Frame<'_>, area: Rect, app: &FilesView, targets
     );
 }
 
+/// The selected file's diff, beside the tree.
+fn draw_diff(f: &mut ratatui::Frame<'_>, area: Rect, app: &mut FilesView) {
+    let Some(file) = app.selected_file() else {
+        f.render_widget(
+            Paragraph::new(Span::styled(
+                "  Pick a file to see its diff.",
+                theme::muted(),
+            ))
+            .block(ui::panel("Diff", true)),
+            area,
+        );
+        return;
+    };
+    if app.diff.file != Some(file) {
+        app.diff.file = Some(file);
+        app.diff.scroll = 0;
+    }
+    let pf = &app.files[file];
+    // Long paths lose their start, not the file name.
+    let room = (area.width as usize).saturating_sub(6);
+    let title = if pf.path.chars().count() > room {
+        let tail: String = pf.path.chars().rev().take(room.saturating_sub(1)).collect();
+        format!("…{}", tail.chars().rev().collect::<String>())
+    } else {
+        pf.path.clone()
+    };
+    let block = ui::panel(&title, true);
+    let inner = block.inner(area);
+    let note =
+        |text: String| Paragraph::new(Span::styled(text, theme::muted())).block(block.clone());
+    match app.diff.patches.get(&pf.pr) {
+        None | Some(Patches::Loading) => {
+            f.render_widget(note("fetching the diff…".to_string()), area);
+        }
+        Some(Patches::Failed(e)) => f.render_widget(note(e.clone()), area),
+        Some(Patches::Loaded(map)) => match map.get(&pf.path).and_then(|p| p.as_deref()) {
+            None => f.render_widget(
+                note(
+                    "GitHub doesn't show a diff for this file — it's binary, too large, or only renamed."
+                        .to_string(),
+                ),
+                area,
+            ),
+            Some(patch) => {
+                let (lines, _) = ui::diff_lines(patch, inner.width as usize);
+                let last = (lines.len() as u16).saturating_sub(inner.height);
+                app.diff.scroll = app.diff.scroll.min(last);
+                f.render_widget(
+                    Paragraph::new(lines)
+                        .block(block)
+                        .scroll((app.diff.scroll, 0)),
+                    area,
+                );
+            }
+        },
+    }
+}
+
 fn draw(f: &mut ratatui::Frame<'_>, area: Rect, app: &mut FilesView) {
     let [summary_area, list_area] =
         Layout::vertical([Constraint::Length(2), Constraint::Min(0)]).areas(area);
@@ -853,6 +1079,8 @@ fn draw(f: &mut ratatui::Frame<'_>, area: Rect, app: &mut FilesView) {
         .map(|d| d.all_files.len().to_string().len())
         .max()
         .unwrap_or(1);
+    // Beside a diff the tree is narrow: give the names the bars' room.
+    let gauge_width = if app.diff.open { 0 } else { 8 };
     let rows: Vec<Row> = app
         .rows_with_guides()
         .into_iter()
@@ -886,7 +1114,7 @@ fn draw(f: &mut ratatui::Frame<'_>, area: Rect, app: &mut FilesView) {
                     }
                     Row::new(vec![
                         Cell::from(Line::from(name)),
-                        Cell::from(Line::from(ui::gauge(done, total, 8))),
+                        Cell::from(Line::from(ui::gauge(done, total, gauge_width))),
                         Cell::from(Span::styled(
                             format!("{done:>digits$}/{total:>digits$}"),
                             theme::muted(),
@@ -945,7 +1173,7 @@ fn draw(f: &mut ratatui::Frame<'_>, area: Rect, app: &mut FilesView) {
         rows,
         [
             Constraint::Min(20),
-            Constraint::Length(8),
+            Constraint::Length(gauge_width as u16),
             Constraint::Length(2 * digits as u16 + 1),
             Constraint::Length(width(all_adds)),
             Constraint::Length(width(all_dels)),
@@ -956,7 +1184,18 @@ fn draw(f: &mut ratatui::Frame<'_>, area: Rect, app: &mut FilesView) {
     .row_highlight_style(theme::selected_row())
     .highlight_symbol(Line::from(Span::styled("▌", theme::accent())))
     .highlight_spacing(HighlightSpacing::Always);
+    let (list_area, diff_area) = if app.diff.open {
+        let [list, diff] =
+            Layout::horizontal([Constraint::Percentage(40), Constraint::Percentage(60)])
+                .areas(list_area);
+        (list, Some(diff))
+    } else {
+        (list_area, None)
+    };
     f.render_stateful_widget(table, list_area, &mut app.table);
+    if let Some(diff_area) = diff_area {
+        draw_diff(f, diff_area, app);
+    }
 
     if let Some(targets) = &app.confirm {
         draw_confirm(f, area, app, targets);
@@ -1069,6 +1308,9 @@ mod tests {
             order: Vec::new(),
             order_by: Vec::new(),
             prognost: None,
+            diff: DiffPane::default(),
+            open_cmd: None,
+            open_request: None,
         }
     }
 
@@ -1159,6 +1401,9 @@ mod tests {
             order: Vec::new(),
             order_by: Vec::new(),
             prognost: None,
+            diff: DiffPane::default(),
+            open_cmd: None,
+            open_request: None,
         }
     }
 
@@ -1256,5 +1501,21 @@ mod tests {
         assert_eq!(a.files[3].viewed, ViewedState::Viewed);
         a.handle_key(KeyCode::Char('o'));
         assert!(!a.order_mode);
+    }
+
+    #[test]
+    fn enter_on_a_file_opens_the_diff_and_esc_closes_it() {
+        let mut a = app(files(&["src/a.rs", "src/b.rs"]), false);
+        a.table.select(Some(1));
+        assert_eq!(a.selected_file(), Some(0));
+        a.handle_key(KeyCode::Enter);
+        assert!(a.takes_esc(), "the diff is open");
+        a.handle_key(KeyCode::Char('J'));
+        assert_eq!(a.diff.scroll, 10);
+        a.handle_key(KeyCode::Char('j'));
+        assert_eq!(a.selected_file(), Some(1), "j still moves the cursor");
+        a.handle_key(KeyCode::Esc);
+        assert!(!a.takes_esc());
+        assert!(a.take_open_request().is_none());
     }
 }

@@ -302,6 +302,7 @@ fn run_pr(args: PrArgs) -> Result<()> {
         sources.push(files_view::PrSource {
             owner: r.owner.clone(),
             repo: r.repo.clone(),
+            number: r.number,
             base: f.files.base_oid,
             head: f.files.head_oid,
         });

@@ -5,7 +5,6 @@ use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Paragraph, Wrap};
-use unicode_width::UnicodeWidthStr;
 
 use crate::format::{clean_body, snippet};
 use crate::handoff;
@@ -597,60 +596,12 @@ fn draw_thread_content(f: &mut ratatui::Frame<'_>, area: Rect, app: &ThreadsView
     f.render_widget(paragraph, area);
 }
 
-/// Parses `@@ -769,8 +800,16 @@` into the old and new starting lines.
-fn hunk_start(header: &str) -> Option<(i64, i64)> {
-    let mut parts = header.split_whitespace().skip(1);
-    let number = |p: &str| p[1..].split(',').next()?.parse::<i64>().ok();
-    let old = number(parts.next()?)?;
-    let new = number(parts.next()?)?;
-    Some((old, new))
-}
-
 /// The hunk with a line-number gutter, added / removed lines tinted, and the
 /// line the comment is on highlighted. Lines are padded to `width` so the
 /// tints run the full width of the pane. Returns the lines and the index of
 /// the highlighted one.
 fn hunk_lines(hunk: &str, target: Option<i64>, width: usize) -> (Vec<Line<'static>>, usize) {
-    let mut new = 0;
-    let mut lines = Vec::new();
-    let mut numbered: Vec<Option<i64>> = Vec::new();
-    for raw in hunk.lines() {
-        if raw.starts_with("@@") {
-            if let Some((_, n)) = hunk_start(raw) {
-                new = n;
-            }
-            lines.push(Line::from(Span::styled(raw.to_string(), theme::faint())));
-            numbered.push(None);
-            continue;
-        }
-        let (marker, rest) = raw.split_at(raw.chars().next().map_or(0, char::len_utf8));
-        let (number, bg, marker_color) = match marker {
-            "+" => {
-                new += 1;
-                (Some(new - 1), Some(theme::ADDED_BG), theme::GREEN)
-            }
-            "-" => (None, Some(theme::REMOVED_BG), theme::RED),
-            _ => {
-                new += 1;
-                (Some(new - 1), None, theme::FAINT)
-            }
-        };
-        let gutter = number.map_or("     ".to_string(), |n| format!("{n:>4} "));
-        let used = gutter.width() + 2 + rest.width();
-        let pad = " ".repeat(width.saturating_sub(used));
-        let line = Line::from(vec![
-            Span::styled(gutter, theme::faint()),
-            Span::styled(format!("{marker} "), Style::default().fg(marker_color)),
-            Span::styled(rest.to_string(), theme::text()),
-            Span::raw(pad),
-        ]);
-        lines.push(match bg {
-            Some(bg) => line.style(Style::default().bg(bg)),
-            None => line,
-        });
-        numbered.push(number);
-    }
-
+    let (mut lines, numbered) = ui::diff_lines(hunk, width);
     // GitHub's diffHunk ends on the commented line, so fall back to the last.
     let target_index = target
         .and_then(|t| numbered.iter().rposition(|n| *n == Some(t)))
@@ -727,8 +678,11 @@ mod tests {
 
     #[test]
     fn hunk_header_gives_old_and_new_starts() {
-        assert_eq!(hunk_start("@@ -769,8 +800,16 @@ export"), Some((769, 800)));
-        assert_eq!(hunk_start("@@ -0,0 +1 @@"), Some((0, 1)));
+        assert_eq!(
+            ui::hunk_start("@@ -769,8 +800,16 @@ export"),
+            Some((769, 800))
+        );
+        assert_eq!(ui::hunk_start("@@ -0,0 +1 @@"), Some((0, 1)));
     }
 
     #[test]
