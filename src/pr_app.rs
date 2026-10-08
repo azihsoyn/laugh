@@ -226,7 +226,7 @@ fn handle_mouse(app: &mut PrApp, kind: MouseEventKind, at: Position) {
                 KeyCode::Up
             };
             match app.screen {
-                Screen::Files => app.files.handle_key(code),
+                Screen::Files => app.files.wheel(kind == MouseEventKind::ScrollDown, at),
                 Screen::Threads => app.threads.handle_key(code),
                 Screen::Checks => app.checks.handle_key(code),
             }

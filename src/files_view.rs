@@ -4,7 +4,7 @@ use std::thread;
 
 use anyhow::{Result, bail};
 use crossterm::event::KeyCode;
-use ratatui::layout::{Constraint, Layout, Rect};
+use ratatui::layout::{Constraint, Layout, Position, Rect};
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Cell, Clear, HighlightSpacing, Paragraph, Row, Table, TableState};
@@ -175,6 +175,8 @@ struct DiffPane {
     scroll: u16,
     /// The file the scroll position belongs to.
     file: Option<usize>,
+    /// Where the pane was last drawn, for the mouse wheel.
+    area: Option<Rect>,
     patches: HashMap<usize, Patches>,
     tx: Sender<PatchResult>,
     rx: Receiver<PatchResult>,
@@ -187,6 +189,7 @@ impl Default for DiffPane {
             open: false,
             scroll: 0,
             file: None,
+            area: None,
             patches: HashMap::new(),
             tx,
             rx,
@@ -686,6 +689,20 @@ impl FilesView {
 
     pub fn open_cmd(&self) -> Option<&str> {
         self.open_cmd.as_deref()
+    }
+
+    /// The mouse wheel: over the diff it scrolls the diff, anywhere else
+    /// it moves the cursor.
+    pub fn wheel(&mut self, down: bool, at: Position) {
+        if self.diff.open && self.diff.area.is_some_and(|a| a.contains(at)) {
+            self.diff.scroll = if down {
+                self.diff.scroll.saturating_add(3)
+            } else {
+                self.diff.scroll.saturating_sub(3)
+            };
+        } else {
+            self.handle_key(if down { KeyCode::Down } else { KeyCode::Up });
+        }
     }
 
     pub fn set_status(&mut self, status: String) {
@@ -1193,6 +1210,7 @@ fn draw(f: &mut ratatui::Frame<'_>, area: Rect, app: &mut FilesView) {
         (list_area, None)
     };
     f.render_stateful_widget(table, list_area, &mut app.table);
+    app.diff.area = diff_area;
     if let Some(diff_area) = diff_area {
         draw_diff(f, diff_area, app);
     }
@@ -1517,5 +1535,17 @@ mod tests {
         a.handle_key(KeyCode::Esc);
         assert!(!a.takes_esc());
         assert!(a.take_open_request().is_none());
+    }
+
+    #[test]
+    fn the_wheel_scrolls_the_diff_under_the_pointer_and_moves_the_cursor_elsewhere() {
+        let mut a = app(files(&["src/a.rs", "src/b.rs"]), false);
+        a.table.select(Some(1));
+        a.handle_key(KeyCode::Enter);
+        a.diff.area = Some(Rect::new(40, 0, 60, 20));
+        a.wheel(true, Position::new(50, 5));
+        assert_eq!((a.diff.scroll, a.selected_file()), (3, Some(0)));
+        a.wheel(true, Position::new(10, 5));
+        assert_eq!((a.diff.scroll, a.selected_file()), (3, Some(1)));
     }
 }
