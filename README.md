@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="assets/logo.svg" width="560" alt="laugh — the GitHub you'd want in a terminal">
+  <img src="assets/logo.svg" width="560" alt="laugh — the GitHub you'd want in a terminal: a review comment smiling with two Viewed ticks for eyes, beside a diff that changes frown to laugh">
 </p>
 
 <p align="center">
@@ -37,7 +37,9 @@ since you viewed them called out, a file or any directory marked viewed in
 one key; and several PRs side by side or together. The Viewed ticks are
 GitHub's own, so the web UI agrees with whatever you mark here.
 
-The name is an ordinary word with `gh` hiding inside it.
+The name is an ordinary word with `gh` hiding inside it. The logo is the
+tool in one picture: a review comment smiling with two Viewed ticks for
+eyes, beside a one-line diff that turns a frown into a laugh.
 
 ## Install
 
