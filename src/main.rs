@@ -1,5 +1,6 @@
 mod files_view;
 mod format;
+mod generated;
 mod github;
 mod handoff;
 mod logo;
@@ -175,6 +176,25 @@ struct Fetched {
     threads: github::PullRequestThreads,
 }
 
+/// Files, then the head's `.gitattributes`, so each file can be marked
+/// generated the way the repository itself would. A missing or unreadable
+/// `.gitattributes` just leaves the built-in patterns.
+fn fetch_files_classified(r: &PrRef) -> Result<github::PullRequestFiles> {
+    let mut data = github::fetch_files(&r.owner, &r.repo, r.number)?;
+    let head_repo = data
+        .head_repo
+        .clone()
+        .unwrap_or_else(|| format!("{}/{}", r.owner, r.repo));
+    let attributes = github::fetch_gitattributes(&head_repo, &data.head_oid)
+        .ok()
+        .flatten();
+    let classifier = generated::Classifier::new(attributes.as_deref());
+    for file in &mut data.files {
+        file.generated = classifier.classify(&file.path);
+    }
+    Ok(data)
+}
+
 fn fetch_all(refs: &[PrRef]) -> Result<Vec<Fetched>> {
     // Every PR's files and threads are independent calls; run them all at once.
     let results: Vec<_> = thread::scope(|s| {
@@ -182,7 +202,7 @@ fn fetch_all(refs: &[PrRef]) -> Result<Vec<Fetched>> {
             .iter()
             .map(|r| {
                 (
-                    s.spawn(|| github::fetch_files(&r.owner, &r.repo, r.number)),
+                    s.spawn(|| fetch_files_classified(r)),
                     s.spawn(|| github::fetch_threads(&r.owner, &r.repo, r.number)),
                 )
             })

@@ -5,7 +5,7 @@ use crossterm::event::KeyCode;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Cell, HighlightSpacing, Paragraph, Row, Table, TableState};
+use ratatui::widgets::{Cell, Clear, HighlightSpacing, Paragraph, Row, Table, TableState};
 
 use crate::model::{PrFile, ViewedState};
 use crate::viewed_sync::{Ledger, Outcome, Worker};
@@ -144,6 +144,8 @@ pub struct FilesView {
     hide_viewed: bool,
     table: TableState,
     status: Option<String>,
+    /// Generated files waiting on a yes / no before they're marked viewed.
+    confirm: Option<Vec<usize>>,
     ledger: Ledger,
     /// `None` only in tests, where nothing should reach GitHub.
     worker: Option<Worker>,
@@ -379,6 +381,7 @@ impl FilesView {
             hide_viewed: false,
             table: TableState::default(),
             status: None,
+            confirm: None,
             worker: Some(Worker::spawn(pr_ids)),
         };
         view.clamp();
@@ -390,8 +393,61 @@ impl FilesView {
         self.drain_outcomes();
     }
 
+    /// Generated files in scope that aren't viewed yet.
+    fn unviewed_generated(&self) -> Vec<usize> {
+        self.dirs[self.view_root()]
+            .all_files
+            .iter()
+            .copied()
+            .filter(|&f| {
+                self.files[f].generated.is_some() && self.files[f].viewed != ViewedState::Viewed
+            })
+            .collect()
+    }
+
+    /// True while the confirmation dialog is open and should get every key.
+    pub fn is_modal(&self) -> bool {
+        self.confirm.is_some()
+    }
+
+    fn ask_to_mark_generated(&mut self) {
+        let targets = self.unviewed_generated();
+        if targets.is_empty() {
+            self.status = Some("no unviewed generated files here".to_string());
+        } else {
+            self.confirm = Some(targets);
+        }
+    }
+
+    fn answer_confirm(&mut self, code: KeyCode) {
+        match code {
+            KeyCode::Char('y') | KeyCode::Enter => {
+                let targets = self.confirm.take().unwrap_or_default();
+                let count = targets.len();
+                let jobs = self.ledger.apply(&mut self.files, &targets, true);
+                if let Some(worker) = &self.worker {
+                    for job in jobs {
+                        worker.send(job);
+                    }
+                }
+                self.status = Some(format!("{count} generated file(s) marked viewed"));
+                self.clamp();
+            }
+            KeyCode::Char('n') | KeyCode::Char('q') | KeyCode::Esc => self.confirm = None,
+            _ => {}
+        }
+    }
+
     pub fn handle_key(&mut self, code: KeyCode) {
         self.status = None;
+        if self.is_modal() {
+            self.answer_confirm(code);
+            return;
+        }
+        if code == KeyCode::Char('m') {
+            self.ask_to_mark_generated();
+            return;
+        }
         let Some(current) = self.current() else {
             if code == KeyCode::Char('H') {
                 self.hide_viewed = !self.hide_viewed;
@@ -466,11 +522,18 @@ impl FilesView {
         } else {
             ("H", "hide viewed")
         };
-        match self.current() {
+        if self.is_modal() {
+            return vec![("y", "mark them viewed"), ("n", "cancel")];
+        }
+        let mut hints = match self.current() {
             Some(RowRef::Dir(_)) => vec![("V", "viewed: everything inside"), ("⏎", "fold"), hide],
             Some(RowRef::File { .. }) => vec![("v", "viewed"), ("V", "whole folder"), hide],
             None => vec![hide],
+        };
+        if !self.unviewed_generated().is_empty() {
+            hints.push(("m", "viewed: generated"));
         }
+        hints
     }
 
     pub fn draw(&mut self, f: &mut ratatui::Frame<'_>, area: Rect) {
@@ -499,6 +562,57 @@ fn count_cell(n: u64, sign: char, color: ratatui::style::Color) -> Cell<'static>
         ))
         .right_aligned(),
     )
+}
+
+/// "Mark these N generated files viewed?" — listing what and why, since it
+/// writes to GitHub for files the reviewer hasn't opened.
+fn draw_confirm(f: &mut ratatui::Frame<'_>, area: Rect, app: &FilesView, targets: &[usize]) {
+    const SHOWN: usize = 12;
+    let mut lines = vec![
+        Line::from(vec![
+            Span::styled("Mark ", theme::text()),
+            Span::styled(format!("{}", targets.len()), theme::bold(theme::accent())),
+            Span::styled(" generated file(s) as viewed?", theme::text()),
+        ]),
+        Line::raw(""),
+    ];
+    for &i in targets.iter().take(SHOWN) {
+        let file = &app.files[i];
+        lines.push(Line::from(vec![
+            Span::raw("  "),
+            viewed_icon(file.viewed),
+            Span::raw(" "),
+            Span::styled(file.path.clone(), theme::text()),
+            Span::styled(
+                format!("  {}", file.generated.unwrap_or("")),
+                theme::faint(),
+            ),
+        ]));
+    }
+    if targets.len() > SHOWN {
+        lines.push(Line::from(Span::styled(
+            format!("  …and {} more", targets.len() - SHOWN),
+            theme::muted(),
+        )));
+    }
+    lines.push(Line::raw(""));
+    let mut keys = vec![Span::raw("  ")];
+    keys.extend(ui::key_hints(&[("y", "mark them viewed"), ("n", "cancel")]));
+    lines.push(Line::from(keys));
+
+    let width = lines
+        .iter()
+        .map(|l| l.width() as u16)
+        .max()
+        .unwrap_or(40)
+        .saturating_add(6)
+        .clamp(44, area.width.saturating_sub(4));
+    let popup = ui::centered(area, width, lines.len() as u16 + 2);
+    f.render_widget(Clear, popup);
+    f.render_widget(
+        Paragraph::new(lines).block(ui::panel("Generated files", true)),
+        popup,
+    );
 }
 
 fn draw(f: &mut ratatui::Frame<'_>, area: Rect, app: &mut FilesView) {
@@ -594,6 +708,10 @@ fn draw(f: &mut ratatui::Frame<'_>, area: Rect, app: &mut FilesView) {
                             viewed_icon(pf.viewed),
                             Span::raw(" "),
                             Span::styled(pf.file_name().to_string(), name_style),
+                            Span::styled(
+                                pf.generated.map_or(String::new(), |why| format!("  {why}")),
+                                theme::faint(),
+                            ),
                         ])),
                         Cell::from(""),
                         Cell::from(""),
@@ -628,6 +746,10 @@ fn draw(f: &mut ratatui::Frame<'_>, area: Rect, app: &mut FilesView) {
     .highlight_symbol(Line::from(Span::styled("▌", theme::accent())))
     .highlight_spacing(HighlightSpacing::Always);
     f.render_stateful_widget(table, list_area, &mut app.table);
+
+    if let Some(targets) = &app.confirm {
+        draw_confirm(f, area, app, targets);
+    }
 }
 
 #[cfg(test)]
@@ -641,6 +763,7 @@ mod tests {
             additions: 1,
             deletions: 0,
             viewed,
+            generated: None,
         }
     }
 
@@ -727,6 +850,7 @@ mod tests {
             hide_viewed,
             table: TableState::default(),
             status: None,
+            confirm: None,
             worker: None,
         }
     }
@@ -810,6 +934,7 @@ mod tests {
             hide_viewed: false,
             table: TableState::default(),
             status: None,
+            confirm: None,
             worker: None,
         }
     }
@@ -847,5 +972,40 @@ mod tests {
         let mut covered = a.dirs[infra].all_files.clone();
         covered.sort();
         assert_eq!(covered, [1, 2]);
+    }
+
+    #[test]
+    fn m_asks_first_and_only_y_marks_the_generated_files() {
+        let mut fs = files(&["src/a.rs", "pnpm-lock.yaml", "ui/__snapshots__/b.snap"]);
+        fs[1].generated = Some("lockfile");
+        fs[2].generated = Some("snapshot");
+        let mut a = app(fs, false);
+        a.handle_key(KeyCode::Char('m'));
+        // In tree order: the snapshot's directory comes before root files.
+        assert_eq!(a.confirm.as_deref(), Some(&[2, 1][..]));
+        a.handle_key(KeyCode::Char('n'));
+        assert!(a.confirm.is_none());
+        assert_eq!(
+            a.files[1].viewed,
+            ViewedState::Unviewed,
+            "cancel writes nothing"
+        );
+        a.handle_key(KeyCode::Char('m'));
+        a.handle_key(KeyCode::Char('y'));
+        assert_eq!(a.files[1].viewed, ViewedState::Viewed);
+        assert_eq!(a.files[2].viewed, ViewedState::Viewed);
+        assert_eq!(a.files[0].viewed, ViewedState::Unviewed);
+    }
+
+    #[test]
+    fn while_the_dialog_is_open_other_keys_do_nothing() {
+        let mut fs = files(&["src/a.rs", "yarn.lock"]);
+        fs[1].generated = Some("lockfile");
+        let mut a = app(fs, false);
+        a.handle_key(KeyCode::Char('m'));
+        a.handle_key(KeyCode::Char('v'));
+        a.handle_key(KeyCode::Char('H'));
+        assert!(a.is_modal() && !a.hide_viewed);
+        assert_eq!(a.files[0].viewed, ViewedState::Unviewed);
     }
 }

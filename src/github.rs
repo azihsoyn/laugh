@@ -230,6 +230,8 @@ query($owner: String!, $repo: String!, $pr: Int!, $after: String) {
       id
       title
       url
+      headRefOid
+      headRepository { nameWithOwner }
       files(first: 100, after: $after) {
         pageInfo { hasNextPage endCursor }
         nodes { path additions deletions viewerViewedState }
@@ -244,7 +246,17 @@ struct FilesPullRequest {
     id: String,
     title: String,
     url: String,
+    #[serde(rename = "headRefOid")]
+    head_oid: String,
+    #[serde(rename = "headRepository")]
+    head_repository: Option<NameWithOwner>,
     files: Connection<RawFile>,
+}
+
+#[derive(Debug, Deserialize)]
+struct NameWithOwner {
+    #[serde(rename = "nameWithOwner")]
+    name_with_owner: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -261,12 +273,16 @@ pub struct PullRequestFiles {
     pub id: String,
     pub title: String,
     pub url: String,
+    /// Where the PR's head lives — a fork's, for PRs from forks — and its
+    /// commit, for reading files as of the PR.
+    pub head_repo: Option<String>,
+    pub head_oid: String,
     pub files: Vec<PrFile>,
 }
 
 pub fn fetch_files(owner: &str, repo: &str, pr: u64) -> Result<PullRequestFiles> {
     let mut files = Vec::new();
-    let mut head: Option<(String, String, String)> = None;
+    let mut head: Option<(String, String, String, Option<String>, String)> = None;
     let mut after: Option<String> = None;
 
     loop {
@@ -274,7 +290,13 @@ pub fn fetch_files(owner: &str, repo: &str, pr: u64) -> Result<PullRequestFiles>
             graphql(FILES_QUERY, &paged_vars(owner, repo, pr, after.as_deref()))?;
         let pull_request = pull_request_of(data, owner, repo, pr)?;
         if head.is_none() {
-            head = Some((pull_request.id, pull_request.title, pull_request.url));
+            head = Some((
+                pull_request.id,
+                pull_request.title,
+                pull_request.url,
+                pull_request.head_repository.map(|r| r.name_with_owner),
+                pull_request.head_oid,
+            ));
         }
         let page = pull_request.files;
         files.extend(page.nodes.into_iter().map(|f| PrFile {
@@ -283,6 +305,7 @@ pub fn fetch_files(owner: &str, repo: &str, pr: u64) -> Result<PullRequestFiles>
             additions: f.additions,
             deletions: f.deletions,
             viewed: f.viewed,
+            generated: None,
         }));
         if !page.page_info.has_next_page {
             break;
@@ -290,13 +313,51 @@ pub fn fetch_files(owner: &str, repo: &str, pr: u64) -> Result<PullRequestFiles>
         after = page.page_info.end_cursor;
     }
 
-    let (id, title, url) = head.context("PR response never returned an id")?;
+    let (id, title, url, head_repo, head_oid) = head.context("PR response never returned an id")?;
     Ok(PullRequestFiles {
         id,
         title,
         url,
+        head_repo,
+        head_oid,
         files,
     })
+}
+
+#[derive(Debug, Deserialize)]
+struct BlobRepository {
+    repository: Option<BlobObject>,
+}
+
+#[derive(Debug, Deserialize)]
+struct BlobObject {
+    object: Option<Blob>,
+}
+
+#[derive(Debug, Deserialize)]
+struct Blob {
+    text: Option<String>,
+}
+
+/// The root `.gitattributes` of `repo` (`owner/name`) at `oid`, if it has one.
+pub fn fetch_gitattributes(repo: &str, oid: &str) -> Result<Option<String>> {
+    let (owner, name) = repo
+        .split_once('/')
+        .with_context(|| format!("unexpected repository name: {repo}"))?;
+    let expression = format!("{oid}:.gitattributes");
+    let data: BlobRepository = graphql(
+        "query($owner: String!, $name: String!, $expression: String!) {
+           repository(owner: $owner, name: $name) {
+             object(expression: $expression) { ... on Blob { text } }
+           }
+         }",
+        &[
+            Var::String("owner", owner),
+            Var::String("name", name),
+            Var::String("expression", &expression),
+        ],
+    )?;
+    Ok(data.repository.and_then(|r| r.object).and_then(|o| o.text))
 }
 
 /// Marks (or unmarks) every path as viewed in a single request: one aliased

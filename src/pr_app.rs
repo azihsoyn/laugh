@@ -115,6 +115,12 @@ fn event_loop(terminal: &mut Term, app: &mut PrApp) -> Result<()> {
                 continue;
             }
         }
+        // A confirmation dialog takes every key — q and Esc cancel it
+        // rather than quitting.
+        if app.screen == Screen::Files && app.files.is_modal() {
+            app.files.handle_key(key.code);
+            continue;
+        }
         match key.code {
             KeyCode::Char('q') | KeyCode::Esc => return Ok(()),
             KeyCode::Char('?') => app.help = true,
@@ -141,6 +147,7 @@ fn tab_at(hits: &[(Screen, Rect)], at: Position) -> Option<Screen> {
 /// turns the wheel into arrow keys by itself).
 fn handle_mouse(app: &mut PrApp, kind: MouseEventKind, at: Position) {
     match kind {
+        _ if app.files.is_modal() => {}
         MouseEventKind::Down(MouseButton::Left) => {
             if app.help {
                 app.help = false;
@@ -354,6 +361,7 @@ const HELP: &[(&str, &[(&str, &str)])] = &[
             ("v", "viewed: this file"),
             ("V", "viewed: everything in the folder"),
             ("H", "hide / show viewed files"),
+            ("m", "viewed: generated files (asks first)"),
             ("g  G", "top / bottom"),
         ],
     ),
