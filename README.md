@@ -120,9 +120,14 @@ pattern, and a path has to match every one:
 
 A word is a glob when it has a `*` that can't be a regex repeat (`*.ts`,
 `src/*/index.ts`, but not `.*\.ts`). One that is neither — say, a regex
-halfway typed — is matched as plain text, and the header says so. `⏎` keeps the filter, `Esc` clears it. While it's on, `V` covers every match at
-once: after showing you the list and asking, it marks them viewed (or, if
-they all are already, unmarks them).
+halfway typed — is matched as plain text, and the header says so.
+`⏎` keeps the filter, `Esc` clears it.
+
+While a filter is on, the tree only counts what matches: each folder's
+viewed count, bar and `+`/`-` are its matching files'. `V` works as always
+but only on matches — on a folder, the matches inside it — and `m` takes
+every match at once, after showing you the list and asking (or, if they're
+all viewed already, unmarks them).
 
 Generated files — lockfiles, snapshots, minified bundles, code generators'
 output, and anything the repository marks `linguist-generated` in its
@@ -222,7 +227,8 @@ link.
 | `H` | hide / show viewed files |
 | `m` | viewed: every generated file (asks first) |
 | `o` | reading order / tree |
-| `/` | filter by path (text, glob or regex) · then `V` for every match (asks first) |
+| `/` | filter by path (text, glob or regex) |
+| `m` with a filter | viewed: every match (asks first) |
 | `⏎` on a file | its diff (or `LAUGH_OPEN_CMD`) |
 | `J` `K` · `Esc` | scroll the diff · close it |
 

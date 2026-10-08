@@ -662,6 +662,17 @@ impl FilesView {
         }
     }
 
+    /// A directory's files that the filter lets through, viewed or not —
+    /// what its counts show and what `V` on it covers.
+    fn dir_files(&self, dir: usize) -> Vec<usize> {
+        self.dirs[dir]
+            .all_files
+            .iter()
+            .copied()
+            .filter(|&f| self.filter.matches(&self.files[f].path))
+            .collect()
+    }
+
     fn viewed_count(&self, indices: &[usize]) -> usize {
         indices
             .iter()
@@ -966,12 +977,12 @@ impl FilesView {
             self.clamp();
             return;
         }
-        if code == KeyCode::Char('V') && self.filter.is_active() {
-            self.ask_to_toggle_matching();
-            return;
-        }
         if code == KeyCode::Char('m') {
-            self.ask_to_mark_generated();
+            if self.filter.is_active() {
+                self.ask_to_toggle_matching();
+            } else {
+                self.ask_to_mark_generated();
+            }
             return;
         }
         if code == KeyCode::Char('o') {
@@ -1025,11 +1036,10 @@ impl FilesView {
                 // On a file, V means "the directory this file sits in".
                 // Files at the repository root have no directory row, so
                 // they fall back to just themselves rather than the whole PR.
+                // With a filter on, only what matches.
                 let targets = match current {
-                    RowRef::Dir(d) => self.dirs[d].all_files.clone(),
-                    RowRef::File { dir, .. } if dir != self.view_root() => {
-                        self.dirs[dir].all_files.clone()
-                    }
+                    RowRef::Dir(d) => self.dir_files(d),
+                    RowRef::File { dir, .. } if dir != self.view_root() => self.dir_files(dir),
                     RowRef::File { file, .. } => vec![file],
                 };
                 self.apply_toggle(&targets);
@@ -1074,9 +1084,14 @@ impl FilesView {
             return vec![("type", "filter by path"), ("⏎", "done"), ("esc", "clear")];
         }
         if self.filter.is_active() && !self.diff.open {
+            let v = match self.current() {
+                Some(RowRef::Dir(_)) => ("V", "viewed: matches inside"),
+                _ => ("V", "matches in folder"),
+            };
             return vec![
-                ("V", "viewed: every match"),
                 ("v", "this file"),
+                v,
+                ("m", "every match"),
                 ("/", "edit"),
                 ("esc", "clear filter"),
                 hide,
@@ -1353,14 +1368,15 @@ fn draw(f: &mut ratatui::Frame<'_>, area: Rect, app: &mut FilesView) {
             match r {
                 RowRef::Dir(d) => {
                     let node = &app.dirs[d];
-                    let done = app.viewed_count(&node.all_files);
-                    let total = node.all_files.len();
+                    let shown = app.dir_files(d);
+                    let done = app.viewed_count(&shown);
+                    let total = shown.len();
                     let fold = if app.collapsed.contains(&d) {
                         "▸ "
                     } else {
                         "▾ "
                     };
-                    let (adds, dels) = node.all_files.iter().fold((0, 0), |(a, d), &i| {
+                    let (adds, dels) = shown.iter().fold((0, 0), |(a, d), &i| {
                         (a + app.files[i].additions, d + app.files[i].deletions)
                     });
                     let mut name = vec![guide, Span::styled(fold, theme::muted())];
@@ -1804,7 +1820,7 @@ mod tests {
     }
 
     #[test]
-    fn slash_filters_by_path_and_v_marks_every_match_after_asking() {
+    fn slash_filters_by_path_and_m_marks_every_match_after_asking() {
         let mut a = app(
             files(&["src/a.spec.ts", "src/a.ts", "lib/b.spec.ts", "README.md"]),
             false,
@@ -1827,7 +1843,7 @@ mod tests {
         shown.sort();
         assert_eq!(shown, [0, 2], "case-insensitive, any depth");
 
-        a.handle_key(KeyCode::Char('V'));
+        a.handle_key(KeyCode::Char('m'));
         let confirm = a.confirm.as_ref().expect("asks first");
         assert_eq!(confirm.what, Bulk::Matching("SPEC".into()));
         a.handle_key(KeyCode::Char('y'));
@@ -1878,5 +1894,36 @@ mod tests {
         assert!(half.literal);
         assert!(half.matches("x/(web)/y"));
         assert!(!half.matches("apps/web/a.ts"));
+    }
+
+    #[test]
+    fn with_a_filter_v_on_a_folder_covers_only_its_matches() {
+        let mut a = app(
+            files(&["src/a.spec.ts", "src/a.ts", "lib/b.spec.ts"]),
+            false,
+        );
+        a.filter.set("*.spec.ts".to_string());
+        a.clamp();
+        let src = a
+            .rows()
+            .iter()
+            .position(|r| matches!(r, RowRef::Dir(d) if label_of(&a.dirs, *d) == "src/"))
+            .expect("src/ is shown");
+        a.table.select(Some(src));
+        a.handle_key(KeyCode::Char('V'));
+        assert!(
+            a.confirm.is_none(),
+            "V on a folder doesn't ask, as without a filter"
+        );
+        let viewed: Vec<bool> = a
+            .files
+            .iter()
+            .map(|f| f.viewed == ViewedState::Viewed)
+            .collect();
+        assert_eq!(viewed, [true, false, false], "not src/a.ts, not lib/");
+        let RowRef::Dir(d) = a.rows()[src] else {
+            unreachable!()
+        };
+        assert_eq!(a.dir_files(d), [0], "its count is of matches only");
     }
 }
