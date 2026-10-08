@@ -45,13 +45,21 @@ eyes, beside a one-line diff that turns a frown into a laugh.
 ## Install
 
 ```sh
-cargo install --git https://github.com/azihsoyn/laugh
+brew install azihsoyn/tap/laugh                            # Homebrew (macOS/Linux)
+cargo install --git https://github.com/azihsoyn/laugh      # or build it (Rust 1.88+)
 ```
 
-You need Rust 1.88 or later to build it, and the [GitHub CLI](https://cli.github.com)
-(`gh`) on your `PATH`, logged in with `gh auth login` — laugh uses its
-credentials and configures nothing of its own. A terminal with truecolor
-support shows the colours as intended.
+Or the prebuilt binary for macOS, Linux or Windows, from the
+[latest release](https://github.com/azihsoyn/laugh/releases/latest):
+
+```sh
+curl --proto '=https' --tlsv1.2 -LsSf https://github.com/azihsoyn/laugh/releases/latest/download/laugh-installer.sh | sh
+```
+
+laugh needs the [GitHub CLI](https://cli.github.com) (`gh`) on your `PATH`,
+logged in with `gh auth login` — it uses those credentials and configures
+nothing of its own. A terminal with truecolor support shows the colours as
+intended.
 
 ## Usage
 
