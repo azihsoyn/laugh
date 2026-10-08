@@ -7,6 +7,7 @@ use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Clear, Paragraph};
 
+use crate::checks_view::ChecksView;
 use crate::files_view::FilesView;
 use crate::term::{Term, with_terminal};
 use crate::threads_view::ThreadsView;
@@ -16,6 +17,7 @@ use crate::{theme, ui};
 enum Screen {
     Files,
     Threads,
+    Checks,
 }
 
 pub struct PrHeader {
@@ -41,6 +43,7 @@ struct PrApp {
     pr_hits: Vec<(Option<usize>, Rect)>,
     files: FilesView,
     threads: ThreadsView,
+    checks: ChecksView,
 }
 
 impl PrApp {
@@ -48,6 +51,7 @@ impl PrApp {
         self.scope = scope;
         self.files.set_scope(scope);
         self.threads.set_scope(scope);
+        self.checks.set_scope(scope);
     }
 
     /// Steps through All, then each PR, wrapping around.
@@ -66,7 +70,12 @@ impl PrApp {
     }
 }
 
-pub fn run(prs: Vec<PrHeader>, files: FilesView, threads: ThreadsView) -> Result<()> {
+pub fn run(
+    prs: Vec<PrHeader>,
+    files: FilesView,
+    threads: ThreadsView,
+    checks: ChecksView,
+) -> Result<()> {
     let mut app = PrApp {
         prs,
         scope: None,
@@ -76,6 +85,7 @@ pub fn run(prs: Vec<PrHeader>, files: FilesView, threads: ThreadsView) -> Result
         pr_hits: Vec::new(),
         files,
         threads,
+        checks,
     };
     if app.prs.len() == 1 {
         app.set_scope(Some(0));
@@ -96,6 +106,9 @@ pub fn run(prs: Vec<PrHeader>, files: FilesView, threads: ThreadsView) -> Result
 fn event_loop(terminal: &mut Term, app: &mut PrApp) -> Result<()> {
     loop {
         app.files.tick();
+        if app.screen == Screen::Checks {
+            app.checks.tick();
+        }
         terminal.draw(|f| draw(f, app))?;
 
         if !event::poll(Duration::from_millis(100))? {
@@ -126,11 +139,13 @@ fn event_loop(terminal: &mut Term, app: &mut PrApp) -> Result<()> {
             KeyCode::Char('?') => app.help = true,
             KeyCode::Char('1') => app.screen = Screen::Files,
             KeyCode::Char('2') => app.screen = Screen::Threads,
+            KeyCode::Char('3') => app.screen = Screen::Checks,
             KeyCode::Char(']') => app.cycle_scope(1),
             KeyCode::Char('[') => app.cycle_scope(-1),
             code => match app.screen {
                 Screen::Files => app.files.handle_key(code),
                 Screen::Threads => app.threads.handle_key(code),
+                Screen::Checks => app.checks.handle_key(code),
             },
         }
     }
@@ -167,6 +182,7 @@ fn handle_mouse(app: &mut PrApp, kind: MouseEventKind, at: Position) {
             match app.screen {
                 Screen::Files => app.files.handle_key(code),
                 Screen::Threads => app.threads.handle_key(code),
+                Screen::Checks => app.checks.handle_key(code),
             }
         }
         _ => {}
@@ -197,6 +213,7 @@ fn draw(f: &mut ratatui::Frame<'_>, app: &mut PrApp) {
     match app.screen {
         Screen::Files => app.files.draw(f, body),
         Screen::Threads => app.threads.draw(f, body),
+        Screen::Checks => app.checks.draw(f, body),
     }
     draw_footer(f, footer, app);
 
@@ -277,6 +294,14 @@ fn draw_tabs(f: &mut ratatui::Frame<'_>, area: Rect, app: &mut PrApp) {
             "Threads",
             app.threads.len().to_string(),
         ),
+        (Screen::Checks, "3", "Checks", {
+            let (failed, total) = app.checks.counts();
+            if failed > 0 {
+                format!("{failed} failed")
+            } else {
+                total.to_string()
+            }
+        }),
     ];
     let mut spans = vec![Span::raw(" ")];
     let mut x = area.x + 1;
@@ -308,6 +333,7 @@ fn draw_footer(f: &mut ratatui::Frame<'_>, area: Rect, app: &PrApp) {
     let mut hints = match app.screen {
         Screen::Files => app.files.hints(),
         Screen::Threads => app.threads.hints(),
+        Screen::Checks => app.checks.hints(),
     };
     if app.prs.len() > 1 {
         hints.push(("[ ]", "PR"));
@@ -319,6 +345,7 @@ fn draw_footer(f: &mut ratatui::Frame<'_>, area: Rect, app: &PrApp) {
     let status = match app.screen {
         Screen::Files => app.files.status(),
         Screen::Threads => app.threads.status(),
+        Screen::Checks => None,
     };
     let note = match status {
         Some(status) => Some(Span::styled(
@@ -347,7 +374,7 @@ const HELP: &[(&str, &[(&str, &str)])] = &[
     (
         "Anywhere",
         &[
-            ("1  2", "files / threads"),
+            ("1 2 3", "files / threads / checks"),
             ("[  ]", "all PRs / one PR at a time"),
             ("?", "this list"),
             ("q", "quit (waits for pending saves)"),
@@ -375,6 +402,13 @@ const HELP: &[(&str, &[(&str, &str)])] = &[
             ("a", "send the thread to your agent"),
             ("r", "hide / show resolved"),
             ("f", "open → resolved → outdated → all"),
+        ],
+    ),
+    (
+        "Checks",
+        &[
+            ("j  k", "move between checks (failures first)"),
+            ("J  K", "scroll the failing step's log"),
         ],
     ),
 ];

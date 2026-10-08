@@ -4,6 +4,7 @@ use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
 
+use crate::checks::{Annotation, Check, CheckState, keep_annotation};
 use crate::model::{Comment, PrFile, Thread, ViewedState};
 
 /// A GraphQL variable: `String` goes through `gh api -f` (always a string),
@@ -397,6 +398,236 @@ pub fn set_viewed(pull_request_id: &str, paths: &[&str], viewed: bool) -> Result
     );
 
     graphql::<serde_json::Value>(&query, &vars).map(|_| ())
+}
+
+// ---- CI checks ----
+
+const CHECKS_QUERY: &str = r#"
+query($owner: String!, $repo: String!, $pr: Int!) {
+  repository(owner: $owner, name: $repo) {
+    pullRequest(number: $pr) {
+      commits(last: 1) { nodes { commit { statusCheckRollup { contexts(first: 100) { nodes {
+        __typename
+        ... on CheckRun {
+          databaseId name status conclusion detailsUrl
+          checkSuite { app { name slug } workflowRun { workflow { name } } }
+          steps(first: 100) { nodes { name conclusion } }
+          annotations(first: 50) { nodes { path annotationLevel message location { start { line } } } }
+        }
+        ... on StatusContext { context state targetUrl }
+      } } } } } }
+    }
+  }
+}
+"#;
+
+#[derive(Debug, Deserialize)]
+struct ChecksPullRequest {
+    commits: Nodes<CommitNode>,
+}
+
+#[derive(Debug, Deserialize)]
+struct Nodes<N> {
+    nodes: Vec<N>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CommitNode {
+    commit: CommitChecks,
+}
+
+#[derive(Debug, Deserialize)]
+struct CommitChecks {
+    #[serde(rename = "statusCheckRollup")]
+    rollup: Option<Rollup>,
+}
+
+#[derive(Debug, Deserialize)]
+struct Rollup {
+    contexts: Nodes<RawContext>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(tag = "__typename")]
+enum RawContext {
+    CheckRun {
+        #[serde(rename = "databaseId")]
+        database_id: Option<u64>,
+        name: String,
+        status: Option<String>,
+        conclusion: Option<String>,
+        #[serde(rename = "detailsUrl")]
+        details_url: Option<String>,
+        #[serde(rename = "checkSuite")]
+        check_suite: Option<CheckSuite>,
+        steps: Option<Nodes<RawStep>>,
+        annotations: Option<Nodes<RawAnnotation>>,
+    },
+    StatusContext {
+        context: String,
+        state: String,
+        #[serde(rename = "targetUrl")]
+        target_url: Option<String>,
+    },
+}
+
+#[derive(Debug, Deserialize)]
+struct CheckSuite {
+    app: Option<App>,
+    #[serde(rename = "workflowRun")]
+    workflow_run: Option<WorkflowRun>,
+}
+
+#[derive(Debug, Deserialize)]
+struct App {
+    name: String,
+    slug: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct WorkflowRun {
+    workflow: NamedNode,
+}
+
+#[derive(Debug, Deserialize)]
+struct NamedNode {
+    name: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawStep {
+    name: String,
+    conclusion: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawAnnotation {
+    path: String,
+    #[serde(rename = "annotationLevel")]
+    level: Option<String>,
+    message: String,
+    location: Option<AnnotationLocation>,
+}
+
+#[derive(Debug, Deserialize)]
+struct AnnotationLocation {
+    start: AnnotationPosition,
+}
+
+#[derive(Debug, Deserialize)]
+struct AnnotationPosition {
+    line: Option<u64>,
+}
+
+impl From<RawContext> for Check {
+    fn from(raw: RawContext) -> Self {
+        match raw {
+            RawContext::CheckRun {
+                database_id,
+                name,
+                status,
+                conclusion,
+                details_url,
+                check_suite,
+                steps,
+                annotations,
+            } => {
+                let state = CheckState::from_github(status.as_deref(), conclusion.as_deref());
+                let (app, workflow) = match check_suite {
+                    Some(suite) => (suite.app, suite.workflow_run.map(|w| w.workflow.name)),
+                    None => (None, None),
+                };
+                let is_actions = app.as_ref().is_some_and(|a| a.slug == "github-actions");
+                let failed_step = steps.and_then(|s| {
+                    s.nodes
+                        .into_iter()
+                        .find(|step| step.conclusion.as_deref() == Some("FAILURE"))
+                        .map(|step| step.name)
+                });
+                Check {
+                    pr: 0,
+                    name,
+                    source: workflow.or(app.map(|a| a.name)),
+                    state,
+                    url: details_url,
+                    failed_step,
+                    job_id: database_id.filter(|_| is_actions),
+                    annotations: annotations
+                        .map(|a| a.nodes)
+                        .unwrap_or_default()
+                        .into_iter()
+                        .filter(|a| keep_annotation(a.level.as_deref().unwrap_or(""), &a.message))
+                        .map(|a| Annotation {
+                            level: a.level.unwrap_or_default().to_lowercase(),
+                            path: a.path,
+                            line: a.location.and_then(|l| l.start.line),
+                            message: a.message,
+                        })
+                        .collect(),
+                }
+            }
+            RawContext::StatusContext {
+                context,
+                state,
+                target_url,
+            } => Check {
+                pr: 0,
+                name: context,
+                source: None,
+                state: CheckState::from_github(None, Some(&state)),
+                url: target_url,
+                failed_step: None,
+                job_id: None,
+                annotations: Vec::new(),
+            },
+        }
+    }
+}
+
+/// Every check and commit status on the PR's latest commit, in the order
+/// worth reading: failed, running, passed, neutral, skipped.
+pub fn fetch_checks(owner: &str, repo: &str, pr: u64) -> Result<Vec<Check>> {
+    let data: RepositoryData<ChecksPullRequest> = graphql(
+        CHECKS_QUERY,
+        &[
+            Var::String("owner", owner),
+            Var::String("repo", repo),
+            Var::Raw("pr", pr.to_string()),
+        ],
+    )?;
+    let pull_request = pull_request_of(data, owner, repo, pr)?;
+    let mut checks: Vec<Check> = pull_request
+        .commits
+        .nodes
+        .into_iter()
+        .filter_map(|c| c.commit.rollup)
+        .flat_map(|r| r.contexts.nodes)
+        .map(Check::from)
+        .collect();
+    for check in &mut checks {
+        // What failed before what merely warned.
+        check.annotations.sort_by_key(|a| a.level != "failure");
+    }
+    checks.sort_by(|a, b| a.state.cmp(&b.state).then_with(|| a.source.cmp(&b.source)));
+    Ok(checks)
+}
+
+/// The raw log of a GitHub Actions job.
+pub fn fetch_job_log(owner: &str, repo: &str, job_id: u64) -> Result<String> {
+    let output = Command::new("gh")
+        .args([
+            "api",
+            &format!("repos/{owner}/{repo}/actions/jobs/{job_id}/logs"),
+        ])
+        .output()
+        .context("failed to run `gh`")?;
+    if !output.status.success() {
+        bail!(
+            "couldn't fetch the job log: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
 /// Infers `owner/repo` from the current directory's `origin` remote via `gh`.

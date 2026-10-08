@@ -1,3 +1,5 @@
+mod checks;
+mod checks_view;
 mod files_view;
 mod format;
 mod generated;
@@ -160,6 +162,7 @@ struct PrJson<'a> {
     pr: PrMetaJson<'a>,
     files: &'a [PrFile],
     threads: &'a [Thread],
+    checks: &'a [checks::Check],
 }
 
 #[derive(Serialize)]
@@ -174,6 +177,7 @@ struct PrMetaJson<'a> {
 struct Fetched {
     files: github::PullRequestFiles,
     threads: github::PullRequestThreads,
+    checks: Vec<checks::Check>,
 }
 
 /// Files, then the head's `.gitattributes`, so each file can be marked
@@ -204,15 +208,17 @@ fn fetch_all(refs: &[PrRef]) -> Result<Vec<Fetched>> {
                 (
                     s.spawn(|| fetch_files_classified(r)),
                     s.spawn(|| github::fetch_threads(&r.owner, &r.repo, r.number)),
+                    s.spawn(|| github::fetch_checks(&r.owner, &r.repo, r.number)),
                 )
             })
             .collect();
         handles
             .into_iter()
-            .map(|(f, t)| {
+            .map(|(f, t, c)| {
                 (
                     f.join().map_err(|_| anyhow!("file fetch panicked")),
                     t.join().map_err(|_| anyhow!("thread fetch panicked")),
+                    c.join().map_err(|_| anyhow!("check fetch panicked")),
                 )
             })
             .collect()
@@ -220,8 +226,9 @@ fn fetch_all(refs: &[PrRef]) -> Result<Vec<Fetched>> {
     results
         .into_iter()
         .zip(refs)
-        .map(|((files, threads), r)| {
+        .map(|((files, threads, checks), r)| {
             Ok(Fetched {
+                checks: checks?.with_context(|| format!("fetching checks for {}", r.full()))?,
                 files: files?
                     .with_context(|| format!("fetching changed files for {}", r.full()))?,
                 threads: threads?
@@ -270,6 +277,7 @@ fn run_pr(args: PrArgs) -> Result<()> {
                     },
                     files: &f.files.files,
                     threads: &f.threads.threads,
+                    checks: &f.checks,
                 })
                 .collect(),
         };
@@ -282,7 +290,12 @@ fn run_pr(args: PrArgs) -> Result<()> {
     let mut pr_ids = Vec::new();
     let mut files = Vec::new();
     let mut threads = Vec::new();
+    let mut checks = Vec::new();
     for (i, (f, r)) in fetched.into_iter().zip(&refs).enumerate() {
+        checks.extend(f.checks.into_iter().map(|mut c| {
+            c.pr = i;
+            c
+        }));
         pr_ids.push(f.files.id);
         files.extend(f.files.files.into_iter().map(|mut file| {
             file.pr = i;
@@ -303,7 +316,18 @@ fn run_pr(args: PrArgs) -> Result<()> {
     pr_app::run(
         headers,
         files_view::FilesView::new(pr_ids, &labels, files),
-        threads_view::ThreadsView::new(threads, labels, refs.iter().map(PrRef::full).collect()),
+        threads_view::ThreadsView::new(
+            threads,
+            labels.clone(),
+            refs.iter().map(PrRef::full).collect(),
+        ),
+        checks_view::ChecksView::new(
+            checks,
+            refs.iter()
+                .map(|r| (r.owner.clone(), r.repo.clone()))
+                .collect(),
+            labels,
+        ),
     )
 }
 
