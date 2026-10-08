@@ -81,6 +81,8 @@ fn parse_pr_ref(
 ) -> Result<PrRef> {
     for prefix in ["https://github.com/", "http://github.com/"] {
         if let Some(rest) = arg.strip_prefix(prefix) {
+            // Links copied from GitHub often carry `#discussion_r…` or `?w=1`.
+            let rest = rest.split(['#', '?']).next().unwrap_or(rest);
             let parts: Vec<&str> = rest.trim_end_matches('/').split('/').collect();
             let pull_idx = parts
                 .iter()
@@ -351,6 +353,14 @@ mod tests {
         assert_eq!(
             parse("https://github.com/acme/design/pull/67/files").unwrap(),
             pr("acme", "design", 67)
+        );
+        assert_eq!(
+            parse("https://github.com/acme/app/pull/12#discussion_r123").unwrap(),
+            pr("acme", "app", 12)
+        );
+        assert_eq!(
+            parse("https://github.com/acme/app/pull/12/files?w=1").unwrap(),
+            pr("acme", "app", 12)
         );
         assert!(parse("acme#4").is_err());
         assert!(parse("acme/infra#x").is_err());
