@@ -9,6 +9,8 @@ use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Cell, Clear, HighlightSpacing, Paragraph, Row, Table, TableState};
 
+use regex::{Regex, RegexBuilder};
+
 use crate::github;
 
 use crate::model::{PrFile, ViewedState};
@@ -174,13 +176,73 @@ enum Bulk {
     Matching(String),
 }
 
-/// Case-insensitive: every whitespace-separated word of `filter` appears
-/// somewhere in `path`.
-fn matches_filter(path: &str, filter: &str) -> bool {
-    let path = path.to_lowercase();
-    filter
-        .split_whitespace()
-        .all(|word| path.contains(&word.to_lowercase()))
+/// The `/` filter. Each whitespace-separated word is a case-insensitive
+/// regex, and a path has to match all of them; a word that isn't a valid
+/// regex (yet — say, halfway through typing a group) is matched as text.
+#[derive(Debug, Default)]
+struct Filter {
+    text: String,
+    words: Vec<Regex>,
+    /// Some word didn't parse as a regex and is being matched as text.
+    literal: bool,
+}
+
+impl Filter {
+    #[cfg(test)]
+    fn new(text: &str) -> Self {
+        let mut filter = Filter::default();
+        filter.set(text.to_string());
+        filter
+    }
+
+    fn set(&mut self, text: String) {
+        self.literal = false;
+        self.words = text
+            .split_whitespace()
+            .filter_map(|word| {
+                RegexBuilder::new(word)
+                    .case_insensitive(true)
+                    .build()
+                    .or_else(|_| {
+                        self.literal = true;
+                        RegexBuilder::new(&regex::escape(word))
+                            .case_insensitive(true)
+                            .build()
+                    })
+                    .ok()
+            })
+            .collect();
+        self.text = text;
+    }
+
+    fn push(&mut self, c: char) {
+        let mut text = std::mem::take(&mut self.text);
+        text.push(c);
+        self.set(text);
+    }
+
+    fn pop(&mut self) {
+        let mut text = std::mem::take(&mut self.text);
+        text.pop();
+        self.set(text);
+    }
+
+    fn clear(&mut self) {
+        self.set(String::new());
+    }
+
+    fn is_empty(&self) -> bool {
+        self.text.is_empty()
+    }
+
+    /// Whether the filter narrows anything down at all.
+    fn is_active(&self) -> bool {
+        !self.words.is_empty()
+    }
+
+    fn matches(&self, path: &str) -> bool {
+        self.words.iter().all(|re| re.is_match(path))
+    }
 }
 
 /// One PR's diffs, by path, as GitHub serves them.
@@ -263,7 +325,7 @@ pub struct FilesView {
     /// Generated files waiting on a yes / no before they're marked viewed.
     confirm: Option<Confirm>,
     /// `/`: only files whose path contains every word of this.
-    filter: String,
+    filter: Filter,
     /// Typing the filter: keys go into it.
     filtering: bool,
     ledger: Ledger,
@@ -298,7 +360,7 @@ impl FilesView {
 
     fn file_visible(&self, file: usize) -> bool {
         !(self.hide_viewed && self.files[file].viewed == ViewedState::Viewed)
-            && matches_filter(&self.files[file].path, &self.filter)
+            && self.filter.matches(&self.files[file].path)
     }
 
     /// Files in scope that match the filter, viewed or not.
@@ -307,7 +369,7 @@ impl FilesView {
             .all_files
             .iter()
             .copied()
-            .filter(|&f| matches_filter(&self.files[f].path, &self.filter))
+            .filter(|&f| self.filter.matches(&self.files[f].path))
             .collect()
     }
 
@@ -340,7 +402,7 @@ impl FilesView {
                 self.confirm = Some(Confirm {
                     targets,
                     viewed,
-                    what: Bulk::Matching(self.filter.trim().to_string()),
+                    what: Bulk::Matching(self.filter.text.trim().to_string()),
                 })
             }
         }
@@ -699,7 +761,7 @@ impl FilesView {
             table: TableState::default(),
             status: None,
             confirm: None,
-            filter: String::new(),
+            filter: Filter::default(),
             filtering: false,
             worker: Some(Worker::spawn(pr_ids)),
         };
@@ -886,7 +948,7 @@ impl FilesView {
             self.clamp();
             return;
         }
-        if code == KeyCode::Char('V') && !self.filter.trim().is_empty() {
+        if code == KeyCode::Char('V') && self.filter.is_active() {
             self.ask_to_toggle_matching();
             return;
         }
@@ -993,7 +1055,7 @@ impl FilesView {
         if self.filtering {
             return vec![("type", "filter by path"), ("⏎", "done"), ("esc", "clear")];
         }
-        if !self.filter.trim().is_empty() && !self.diff.open {
+        if self.filter.is_active() && !self.diff.open {
             return vec![
                 ("V", "viewed: every match"),
                 ("v", "this file"),
@@ -1227,7 +1289,7 @@ fn draw(f: &mut ratatui::Frame<'_>, area: Rect, app: &mut FilesView) {
         summary.push(Span::raw("   "));
         summary.push(Span::styled(" / ", theme::pill_on()));
         summary.push(Span::styled(
-            format!(" {}", app.filter),
+            format!(" {}", app.filter.text),
             theme::bold(theme::text()),
         ));
         if app.filtering {
@@ -1237,6 +1299,12 @@ fn draw(f: &mut ratatui::Frame<'_>, area: Rect, app: &mut FilesView) {
             format!("  {} match", app.matching().len()),
             theme::muted(),
         ));
+        if app.filter.literal {
+            summary.push(Span::styled(
+                "  · not a valid regex, matched as text",
+                Style::default().fg(theme::YELLOW),
+            ));
+        }
     }
     if app.order_mode {
         summary.push(Span::raw("   "));
@@ -1480,7 +1548,7 @@ mod tests {
             table: TableState::default(),
             status: None,
             confirm: None,
-            filter: String::new(),
+            filter: Filter::default(),
             filtering: false,
             worker: None,
             sources: Vec::new(),
@@ -1575,7 +1643,7 @@ mod tests {
             table: TableState::default(),
             status: None,
             confirm: None,
-            filter: String::new(),
+            filter: Filter::default(),
             filtering: false,
             worker: None,
             sources: Vec::new(),
@@ -1762,8 +1830,23 @@ mod tests {
 
     #[test]
     fn every_word_of_the_filter_must_appear() {
-        assert!(matches_filter("apps/web/src/Button.spec.ts", "web spec"));
-        assert!(!matches_filter("apps/api/src/Button.spec.ts", "web spec"));
-        assert!(matches_filter("anything", "  "));
+        assert!(Filter::new("web spec").matches("apps/web/src/Button.spec.ts"));
+        assert!(!Filter::new("web spec").matches("apps/api/src/Button.spec.ts"));
+        assert!(Filter::new("  ").matches("anything"));
+        assert!(!Filter::new("  ").is_active());
+    }
+
+    #[test]
+    fn words_are_regexes_and_broken_ones_match_as_text() {
+        let f = Filter::new(r"^apps/(web|api)/.*\.SPEC\.ts$");
+        assert!(f.matches("apps/api/src/Button.spec.ts"));
+        assert!(!f.matches("apps/admin/src/Button.spec.ts"));
+        assert!(!f.matches("apps/api/src/Button.spec.tsx"));
+        assert!(!f.literal);
+
+        let half = Filter::new("(web");
+        assert!(half.literal);
+        assert!(half.matches("x/(web)/y"));
+        assert!(!half.matches("apps/web/a.ts"));
     }
 }
