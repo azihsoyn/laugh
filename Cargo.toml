@@ -10,6 +10,7 @@ homepage = "https://github.com/azihsoyn/laugh"
 readme = "README.md"
 keywords = ["github", "pull-request", "review", "tui", "cli"]
 categories = ["command-line-utilities", "development-tools"]
+exclude = ["demo.gif", "demo.tape", ".github/"]
 
 [dependencies]
 anyhow = "1.0.104"
