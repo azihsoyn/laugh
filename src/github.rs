@@ -118,6 +118,7 @@ query($owner: String!, $repo: String!, $pr: Int!, $after: String) {
               diffHunk
               createdAt
               url
+              viewerDidAuthor
             }
           }
         }
@@ -160,6 +161,8 @@ struct RawComment {
     #[serde(rename = "createdAt")]
     created_at: Option<String>,
     url: Option<String>,
+    #[serde(rename = "viewerDidAuthor", default)]
+    viewer_did_author: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -194,6 +197,7 @@ impl From<RawThread> for Thread {
                         diff_hunk: c.diff_hunk,
                         created_at: c.created_at,
                         url: c.url,
+                        viewer_did_author: c.viewer_did_author,
                     }
                 })
                 .collect(),

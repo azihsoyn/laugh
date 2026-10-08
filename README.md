@@ -174,9 +174,10 @@ Every review thread — open, resolved and outdated — as a row of cards. The
 cards are grouped by who started the thread, people first and bots after,
 and open on the first person rather than on the bots.
 
-The thread you're on is shown in full on the left:
+The thread you're on is shown in full on the left, as a chat:
 
-- each comment with its author and how long ago it was written
+- each comment in its own bubble — other people's on the left, yours on
+  the right — with who wrote it and how long ago
 - bold, `code`, code blocks and suggested diffs rendered
 
 On the right is the code it was written against: the diff hunk with line

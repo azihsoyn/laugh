@@ -7,7 +7,7 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Padding};
 
-use unicode_width::UnicodeWidthStr;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::theme;
 
@@ -203,6 +203,67 @@ pub fn markdown(text: &str) -> Vec<Line<'static>> {
     lines
 }
 
+/// Breaks a styled line into lines at most `width` columns wide: at the
+/// last space, or between full-width characters (Japanese has no spaces
+/// between words), or anywhere if a word is longer than the line. Styles
+/// carry over; the space a line breaks at is dropped.
+pub fn wrap(line: &Line<'static>, width: usize) -> Vec<Line<'static>> {
+    let width = width.max(1);
+    let wide = |c: char| c.width().unwrap_or(0) > 1;
+    let mut rows: Vec<Vec<(char, Style)>> = vec![Vec::new()];
+    let mut used = 0;
+    for span in &line.spans {
+        let style = line.style.patch(span.style);
+        for ch in span.content.chars() {
+            let w = ch.width().unwrap_or(0);
+            let row = rows.last_mut().expect("a row");
+            if used + w > width && !row.is_empty() {
+                if ch == ' ' {
+                    rows.push(Vec::new());
+                    used = 0;
+                    continue;
+                }
+                // Split before row[at]: after a space, or next to a
+                // full-width character; right here counts too.
+                let here = wide(ch) || row.last().is_some_and(|&(c, _)| wide(c) || c == ' ');
+                let at = if here {
+                    Some(row.len())
+                } else {
+                    (1..row.len())
+                        .rev()
+                        .find(|&i| row[i - 1].0 == ' ' || wide(row[i - 1].0) || wide(row[i].0))
+                };
+                let carried = match at {
+                    Some(at) => {
+                        let rest = row.split_off(at);
+                        if row.last().is_some_and(|&(c, _)| c == ' ') {
+                            row.pop();
+                        }
+                        rest
+                    }
+                    None => Vec::new(),
+                };
+                used = carried.iter().map(|(c, _)| c.width().unwrap_or(0)).sum();
+                rows.push(carried);
+            }
+            rows.last_mut().expect("a row").push((ch, style));
+            used += w;
+        }
+    }
+    rows.into_iter()
+        .map(|row| {
+            let mut spans: Vec<Span<'static>> = Vec::new();
+            for (ch, style) in row {
+                match spans.last_mut() {
+                    Some(last) if last.style == style => last.content.to_mut().push(ch),
+                    _ => spans.push(Span::styled(ch.to_string(), style)),
+                }
+            }
+            Line::from(spans)
+        })
+        .collect()
+}
+
 /// Parses `@@ -769,8 +800,16 @@` into the old and new starting lines.
 pub fn hunk_start(header: &str) -> Option<(i64, i64)> {
     let mut parts = header.split_whitespace().skip(1);
@@ -271,6 +332,36 @@ pub fn diff_lines(diff: &str, width: usize) -> (Vec<Line<'static>>, Vec<Option<i
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn texts(lines: &[Line]) -> Vec<String> {
+        lines.iter().map(|l| l.to_string()).collect()
+    }
+
+    #[test]
+    fn wrap_breaks_at_spaces_or_anywhere_and_keeps_styles() {
+        let line = Line::from(vec![
+            Span::raw("cap the "),
+            Span::styled("retries", theme::accent()),
+            Span::raw(" at three"),
+        ]);
+        let rows = wrap(&line, 10);
+        assert_eq!(texts(&rows), ["cap the", "retries at", "three"]);
+        assert_eq!(rows[1].spans[0].style, theme::accent());
+        assert_eq!(
+            texts(&wrap(&Line::raw("実行ログが大きい"), 6)),
+            ["実行ロ", "グが大", "きい"]
+        );
+        assert_eq!(texts(&wrap(&Line::raw(""), 6)), [""]);
+        // English words stay whole; Japanese breaks between characters.
+        assert_eq!(
+            texts(&wrap(&Line::raw("signal は GetObject に渡す"), 12)),
+            ["signal は", "GetObject に", "渡す"]
+        );
+        assert_eq!(
+            texts(&wrap(&Line::raw("ほかの S3 操作は再試行します"), 12)),
+            ["ほかの S3 操", "作は再試行し", "ます"]
+        );
+    }
 
     fn plain(line: &Line) -> String {
         line.spans.iter().map(|s| s.content.as_ref()).collect()

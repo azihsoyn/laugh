@@ -4,7 +4,8 @@ use crossterm::event::KeyCode;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, BorderType, Borders, Paragraph, Wrap};
+use ratatui::widgets::{Block, BorderType, Borders, Paragraph};
+use unicode_width::UnicodeWidthStr;
 
 use crate::format::{clean_body, snippet};
 use crate::handoff;
@@ -564,36 +565,117 @@ fn draw_thread_content(f: &mut ratatui::Frame<'_>, area: Rect, app: &ThreadsView
         app.visible_indices().len()
     );
 
+    // Inside the border and the panel's padding.
+    let width = area.width.saturating_sub(4) as usize;
     let mut lines: Vec<Line> = vec![Line::from(state_badge(thread)), Line::raw("")];
-    for comment in &thread.comments {
-        let who = if comment.author_is_bot {
-            theme::muted()
-        } else {
-            theme::accent()
-        };
-        let mut header = vec![
-            Span::styled("● ", who),
-            Span::styled(comment.author.clone(), theme::bold(who)),
-        ];
-        if comment.author_is_bot {
-            header.push(Span::styled(" bot", theme::faint()));
-        }
-        if let Some(ts) = &comment.created_at {
-            header.push(Span::styled(
-                format!("  {}", ui::relative_time(ts)),
-                theme::faint(),
-            ));
-        }
-        lines.push(Line::from(header));
-        lines.extend(ui::markdown(&clean_body(&comment.body)));
-        lines.push(Line::raw(""));
-    }
+    lines.extend(conversation(thread, width));
 
+    // Already wrapped to fit, bubble by bubble.
     let paragraph = Paragraph::new(lines)
         .block(ui::panel(&position, focused))
-        .wrap(Wrap { trim: false })
         .scroll((app.thread_scroll, 0));
     f.render_widget(paragraph, area);
+}
+
+/// The thread as a chat: each comment in its own bubble, other people's on
+/// the left and the viewer's on the right, as in a messaging app. The name
+/// is shown when the author changes; the time sits on the bubble's bottom
+/// edge.
+fn conversation(thread: &Thread, width: usize) -> Vec<Line<'static>> {
+    // A bubble takes at most this much of the pane, so the side it leans
+    // to is visible even for long comments.
+    let max_outer = if width < 30 {
+        width
+    } else {
+        (width * 4 / 5).max(30)
+    };
+    let max_inner = max_outer.saturating_sub(4).max(1);
+    let mut lines = Vec::new();
+    let mut last_author: Option<&str> = None;
+    for comment in &thread.comments {
+        let mine = comment.viewer_did_author;
+        let edge = if mine {
+            theme::accent()
+        } else if comment.author_is_bot {
+            theme::faint()
+        } else {
+            theme::muted()
+        };
+
+        let mut body: Vec<Line<'static>> = ui::markdown(&clean_body(&comment.body))
+            .iter()
+            .flat_map(|l| ui::wrap(l, max_inner))
+            .collect();
+        while body.last().is_some_and(|l| l.width() == 0) {
+            body.pop();
+        }
+        if body.is_empty() {
+            body.push(Line::raw(""));
+        }
+        let time = comment
+            .created_at
+            .as_deref()
+            .map(|ts| format!(" {} ", ui::relative_time(ts)))
+            .unwrap_or_default();
+        let inner = body
+            .iter()
+            .map(Line::width)
+            .max()
+            .unwrap_or(0)
+            .max(time.width().saturating_sub(1))
+            .min(max_inner);
+        let outer = inner + 4;
+        let indent = if mine {
+            " ".repeat(width.saturating_sub(outer))
+        } else {
+            String::new()
+        };
+
+        if last_author != Some(comment.author.as_str()) {
+            if last_author.is_some() {
+                lines.push(Line::raw(""));
+            }
+            let mut name = vec![Span::raw(indent.clone())];
+            if mine {
+                let label = "you";
+                name[0] = Span::raw(" ".repeat(width.saturating_sub(label.len())));
+                name.push(Span::styled(label, theme::bold(theme::accent())));
+            } else {
+                let who = if comment.author_is_bot {
+                    theme::muted()
+                } else {
+                    theme::accent()
+                };
+                name.push(Span::styled(comment.author.clone(), theme::bold(who)));
+                if comment.author_is_bot {
+                    name.push(Span::styled(" bot", theme::faint()));
+                }
+            }
+            lines.push(Line::from(name));
+        }
+        last_author = Some(comment.author.as_str());
+
+        lines.push(Line::from(vec![
+            Span::raw(indent.clone()),
+            Span::styled(format!("╭{}╮", "─".repeat(inner + 2)), edge),
+        ]));
+        for row in body {
+            let pad = inner.saturating_sub(row.width());
+            let mut spans = vec![Span::raw(indent.clone()), Span::styled("│ ", edge)];
+            spans.extend(row.spans);
+            spans.push(Span::raw(" ".repeat(pad)));
+            spans.push(Span::styled(" │", edge));
+            lines.push(Line::from(spans));
+        }
+        let rule = (inner + 2).saturating_sub(time.width());
+        lines.push(Line::from(vec![
+            Span::raw(indent),
+            Span::styled(format!("╰{}", "─".repeat(rule)), edge),
+            Span::styled(time, theme::faint()),
+            Span::styled("╯", edge),
+        ]));
+    }
+    lines
 }
 
 /// The hunk with a line-number gutter, added / removed lines tinted, and the
@@ -675,6 +757,56 @@ fn draw_code(f: &mut ratatui::Frame<'_>, area: Rect, app: &ThreadsView) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn comment(author: &str, body: &str, mine: bool) -> crate::model::Comment {
+        crate::model::Comment {
+            author: author.into(),
+            author_is_bot: false,
+            body: body.into(),
+            diff_hunk: None,
+            created_at: None,
+            url: None,
+            viewer_did_author: mine,
+        }
+    }
+
+    #[test]
+    fn the_conversation_puts_others_left_and_mine_right_in_bubbles() {
+        let thread = Thread {
+            pr: 0,
+            is_resolved: false,
+            is_outdated: false,
+            path: None,
+            line: None,
+            original_line: None,
+            comments: vec![
+                comment("alice", "Cap it?", false),
+                comment("alice", "Three is plenty.", false),
+                comment("me", "Done.", true),
+            ],
+        };
+        let rows: Vec<String> = conversation(&thread, 40)
+            .iter()
+            .map(|l| l.to_string())
+            .collect();
+        assert_eq!(
+            rows,
+            [
+                "alice",
+                "╭─────────╮",
+                "│ Cap it? │",
+                "╰─────────╯",
+                "╭──────────────────╮",
+                "│ Three is plenty. │",
+                "╰──────────────────╯",
+                "",
+                "                                     you",
+                "                               ╭───────╮",
+                "                               │ Done. │",
+                "                               ╰───────╯",
+            ]
+        );
+    }
 
     #[test]
     fn hunk_header_gives_old_and_new_starts() {

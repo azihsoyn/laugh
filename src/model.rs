@@ -49,6 +49,8 @@ pub struct Comment {
     pub diff_hunk: Option<String>,
     pub created_at: Option<String>,
     pub url: Option<String>,
+    /// Written by whoever is running laugh (`gh`'s account).
+    pub viewer_did_author: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
