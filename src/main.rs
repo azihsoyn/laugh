@@ -1,6 +1,7 @@
 mod files_view;
 mod format;
 mod github;
+mod logo;
 mod model;
 mod pr_app;
 mod term;
@@ -13,12 +14,13 @@ use std::ffi::OsString;
 use std::thread;
 
 use anyhow::{Context, Result, anyhow};
-use clap::{Args, CommandFactory, Parser, Subcommand};
+use clap::{Args, CommandFactory, FromArgMatches, Parser, Subcommand};
 use model::{PrFile, Thread};
 use serde::Serialize;
 
-/// The GitHub you'd want in a terminal: the things GitHub hides or makes
-/// awkward, without opening a browser.
+/// Review pull requests in the terminal: every review thread, resolved ones
+/// included, and the changed files with GitHub's own Viewed checkboxes — for
+/// one PR or a related set across repositories.
 ///
 /// `laugh <pr>` with no subcommand is `laugh pr <pr>`.
 #[derive(Parser, Debug)]
@@ -299,7 +301,10 @@ fn with_default_subcommand(mut args: Vec<OsString>) -> Vec<OsString> {
 }
 
 fn main() -> Result<()> {
-    let cli = Cli::parse_from(with_default_subcommand(std::env::args_os().collect()));
+    let matches = Cli::command()
+        .before_help(logo::colored())
+        .get_matches_from(with_default_subcommand(std::env::args_os().collect()));
+    let cli = Cli::from_arg_matches(&matches).unwrap_or_else(|e| e.exit());
     match cli.command {
         Command::Pr(args) => run_pr(args),
     }
