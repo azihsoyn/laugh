@@ -99,10 +99,10 @@ shows how much of it you've viewed, and the bar at the top shows the total.
   what needs a second look
 
 `v` marks the file under the cursor viewed (or unviewed). `V` does the same
-for everything under a directory, however deep, in one request to GitHub. The
-tree starts at `/` — or, in **All**, at each PR's own row — so `V` there
-covers the whole PR. If everything there is
-already viewed, it unmarks it all; otherwise it marks the rest.
+for everything under a directory, however deep, in one request to GitHub.
+The tree starts at `/` — or, in **All**, at each PR's own row — so `V`
+there covers the whole PR. If everything there is already viewed, it
+unmarks it all; otherwise it marks the rest.
 
 Changes show on screen the moment you press the key. The writes to GitHub
 happen in the background, in order (`⇅ saving N` while they're in flight).
