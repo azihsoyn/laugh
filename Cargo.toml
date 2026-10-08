@@ -10,7 +10,7 @@ homepage = "https://github.com/azihsoyn/laugh"
 readme = "README.md"
 keywords = ["github", "pull-request", "review", "tui", "cli"]
 categories = ["command-line-utilities", "development-tools"]
-exclude = ["demo.gif", "demo.tape", ".github/"]
+exclude = ["demo.gif", "demo.tape", ".github/", "dist-workspace.toml"]
 
 [dependencies]
 anyhow = "1.0.104"
@@ -21,3 +21,7 @@ regex = "1.13.1"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
 unicode-width = "0.2"
+
+[profile.dist]
+inherits = "release"
+lto = "thin"
