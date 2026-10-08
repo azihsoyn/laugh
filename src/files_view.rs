@@ -11,7 +11,7 @@ use ratatui::widgets::{Cell, Clear, HighlightSpacing, Paragraph, Row, Table, Tab
 
 use regex::{Regex, RegexBuilder};
 
-use crate::github;
+use crate::{generated, github};
 
 use crate::model::{PrFile, ViewedState};
 use crate::reading_order::{self, Step};
@@ -176,9 +176,30 @@ enum Bulk {
     Matching(String),
 }
 
+/// A word reads as a glob when it has a `*` that can't be a regex
+/// repetition: at the start, or after anything but `.`, `)`, `]` or `\`.
+/// So `*.spec.ts` and `src/*/index.ts` are globs, `.*\.ts` is a regex.
+fn is_glob(word: &str) -> bool {
+    let chars: Vec<char> = word.chars().collect();
+    chars.iter().enumerate().any(|(i, &c)| {
+        c == '*' && (i == 0 || !matches!(chars[i - 1], '.' | ')' | ']' | '\\' | '*'))
+    })
+}
+
+fn word_regex(word: &str) -> Option<Regex> {
+    let source = if is_glob(word) {
+        generated::glob_pattern(word)?
+    } else {
+        word.to_string()
+    };
+    RegexBuilder::new(&source)
+        .case_insensitive(true)
+        .build()
+        .ok()
+}
 /// The `/` filter. Each whitespace-separated word is a case-insensitive
-/// regex, and a path has to match all of them; a word that isn't a valid
-/// regex (yet — say, halfway through typing a group) is matched as text.
+/// glob or regex, and a path has to match all of them; a word that is
+/// neither (yet — say, halfway through typing a group) is matched as text.
 #[derive(Debug, Default)]
 struct Filter {
     text: String,
@@ -200,16 +221,13 @@ impl Filter {
         self.words = text
             .split_whitespace()
             .filter_map(|word| {
-                RegexBuilder::new(word)
-                    .case_insensitive(true)
-                    .build()
-                    .or_else(|_| {
-                        self.literal = true;
-                        RegexBuilder::new(&regex::escape(word))
-                            .case_insensitive(true)
-                            .build()
-                    })
-                    .ok()
+                word_regex(word).or_else(|| {
+                    self.literal = true;
+                    RegexBuilder::new(&regex::escape(word))
+                        .case_insensitive(true)
+                        .build()
+                        .ok()
+                })
             })
             .collect();
         self.text = text;
@@ -1843,6 +1861,18 @@ mod tests {
         assert!(!f.matches("apps/admin/src/Button.spec.ts"));
         assert!(!f.matches("apps/api/src/Button.spec.tsx"));
         assert!(!f.literal);
+
+        let glob = Filter::new("*.spec.ts");
+        assert!(!glob.literal);
+        assert!(glob.matches("apps/web/src/Button.SPEC.ts"));
+        assert!(!glob.matches("apps/web/src/Button.ts"));
+        assert!(!glob.matches("apps/web/src/Button.spec.tsx"));
+        let rooted = Filter::new("apps/**/*.ts");
+        assert!(rooted.matches("apps/web/src/a.ts"));
+        assert!(!rooted.matches("lib/apps/a.ts"));
+        assert!(is_glob("src/*/index.ts"));
+        assert!(!is_glob(r".*\.ts$"));
+        assert!(!is_glob("(a|b)*"));
 
         let half = Filter::new("(web");
         assert!(half.literal);
