@@ -310,6 +310,7 @@ fn usable_checkout(dir: &Path, owner: &str, repo: &str, commits: &[&str]) -> boo
 /// Runs `prognost plan` between the PR's base and head in the current
 /// directory, if prognost is installed and the directory is a checkout of
 /// the PR's repository with both commits — otherwise `Ok(None)`.
+#[tracing::instrument(skip_all, fields(repo = %format!("{owner}/{repo}")), err)]
 pub fn prognost_deps(
     files: &[PrFile],
     indices: &[usize],

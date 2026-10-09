@@ -26,6 +26,7 @@ struct GraphQlError {
     message: String,
 }
 
+#[tracing::instrument(level = "debug", name = "gh api graphql", skip_all)]
 fn graphql<T: DeserializeOwned>(query: &str, vars: &[Var]) -> Result<T> {
     let mut cmd = Command::new("gh");
     cmd.args(["api", "graphql", "-f", &format!("query={query}")]);
@@ -209,6 +210,7 @@ pub struct PullRequestThreads {
     pub threads: Vec<Thread>,
 }
 
+#[tracing::instrument(skip_all, fields(pr = %format!("{owner}/{repo}#{pr}")), err)]
 pub fn fetch_threads(owner: &str, repo: &str, pr: u64) -> Result<PullRequestThreads> {
     let mut threads = Vec::new();
     let mut after: Option<String> = None;
@@ -290,6 +292,7 @@ pub struct PullRequestFiles {
     pub files: Vec<PrFile>,
 }
 
+#[tracing::instrument(skip_all, fields(pr = %format!("{owner}/{repo}#{pr}")), err)]
 pub fn fetch_files(owner: &str, repo: &str, pr: u64) -> Result<PullRequestFiles> {
     let mut files = Vec::new();
     let mut head: Option<(String, String, String, Option<String>, String, String)> = None;
@@ -353,6 +356,7 @@ struct Blob {
 }
 
 /// The root `.gitattributes` of `repo` (`owner/name`) at `oid`, if it has one.
+#[tracing::instrument(skip(oid), err)]
 pub fn fetch_gitattributes(repo: &str, oid: &str) -> Result<Option<String>> {
     let (owner, name) = repo
         .split_once('/')
@@ -377,6 +381,7 @@ pub fn fetch_gitattributes(repo: &str, oid: &str) -> Result<Option<String>> {
 /// mutation per path in one document, so a whole directory costs one round
 /// trip instead of one `gh` process per file. Paths travel as variables,
 /// never spliced into the query text.
+#[tracing::instrument(skip_all, fields(files = paths.len(), viewed), err)]
 pub fn set_viewed(pull_request_id: &str, paths: &[&str], viewed: bool) -> Result<()> {
     if paths.is_empty() {
         return Ok(());
@@ -602,6 +607,7 @@ impl From<RawContext> for Check {
 
 /// Every check and commit status on the PR's latest commit, in the order
 /// worth reading: failed, running, passed, neutral, skipped.
+#[tracing::instrument(skip_all, fields(pr = %format!("{owner}/{repo}#{pr}")), err)]
 pub fn fetch_checks(owner: &str, repo: &str, pr: u64) -> Result<Vec<Check>> {
     let data: RepositoryData<ChecksPullRequest> = graphql(
         CHECKS_QUERY,
@@ -632,6 +638,7 @@ pub fn fetch_checks(owner: &str, repo: &str, pr: u64) -> Result<Vec<Check>> {
 /// Fetches the steps of the failed check runs among `contexts`, for the
 /// step that failed. Asking for every run's steps in the checks query costs
 /// seconds on a PR with dozens of jobs; the failures are usually a few.
+#[tracing::instrument(skip_all, fields(failed = tracing::field::Empty), err)]
 fn fill_failed_steps(contexts: &mut [RawContext]) -> Result<()> {
     #[derive(Deserialize)]
     struct StepsData {
@@ -658,6 +665,7 @@ fn fill_failed_steps(contexts: &mut [RawContext]) -> Result<()> {
             _ => None,
         })
         .collect();
+    tracing::Span::current().record("failed", failed.len());
     if failed.is_empty() {
         return Ok(());
     }
@@ -689,6 +697,7 @@ fn fill_failed_steps(contexts: &mut [RawContext]) -> Result<()> {
 
 /// Every changed file's unified diff, by path, from the REST files list.
 /// GitHub leaves `patch` out for binary files and very large diffs.
+#[tracing::instrument(skip_all, fields(pr = %format!("{owner}/{repo}#{pr}")), err)]
 pub fn fetch_patches(owner: &str, repo: &str, pr: u64) -> Result<HashMap<String, Option<String>>> {
     #[derive(Deserialize)]
     struct File {
@@ -722,6 +731,7 @@ pub fn fetch_patches(owner: &str, repo: &str, pr: u64) -> Result<HashMap<String,
 }
 
 /// The raw log of a GitHub Actions job.
+#[tracing::instrument(skip(owner, repo), err)]
 pub fn fetch_job_log(owner: &str, repo: &str, job_id: u64) -> Result<String> {
     let output = Command::new("gh")
         .args([
@@ -740,6 +750,7 @@ pub fn fetch_job_log(owner: &str, repo: &str, job_id: u64) -> Result<String> {
 }
 
 /// Infers `owner/repo` from the current directory's `origin` remote via `gh`.
+#[tracing::instrument(err)]
 pub fn infer_repo() -> Result<(String, String)> {
     let output = Command::new("gh")
         .args([
