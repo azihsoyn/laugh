@@ -50,6 +50,11 @@ struct Rule {
 /// A pattern without a slash matches a file name at any depth; one with a
 /// slash is relative to the repository root.
 fn glob_to_regex(pattern: &str) -> Option<Regex> {
+    Regex::new(&glob_pattern(pattern)?).ok()
+}
+
+/// [`glob_to_regex`]'s regex source, for callers that build it themselves.
+pub fn glob_pattern(pattern: &str) -> Option<String> {
     let anchored = pattern.trim_end_matches('/').contains('/');
     let pattern = pattern.trim_start_matches('/');
     let mut re = String::from(if anchored { "^" } else { "^(?:.*/)?" });
@@ -80,7 +85,7 @@ fn glob_to_regex(pattern: &str) -> Option<Regex> {
         i += 1;
     }
     re.push('$');
-    Regex::new(&re).ok()
+    Some(re)
 }
 
 pub struct Classifier {

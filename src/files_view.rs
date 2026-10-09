@@ -9,7 +9,9 @@ use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Cell, Clear, HighlightSpacing, Paragraph, Row, Table, TableState};
 
-use crate::github;
+use regex::{Regex, RegexBuilder};
+
+use crate::{generated, github};
 
 use crate::model::{PrFile, ViewedState};
 use crate::reading_order::{self, Step};
@@ -159,6 +161,108 @@ pub struct OpenRequest {
     pub head: String,
 }
 
+/// A bulk Viewed change waiting on a yes / no.
+#[derive(Debug)]
+struct Confirm {
+    targets: Vec<usize>,
+    viewed: bool,
+    /// What the files have in common, for the dialog's title and question.
+    what: Bulk,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Bulk {
+    Generated,
+    Matching(String),
+}
+
+/// A word reads as a glob when it has a `*` that can't be a regex
+/// repetition: at the start, or after anything but `.`, `)`, `]` or `\`.
+/// So `*.spec.ts` and `src/*/index.ts` are globs, `.*\.ts` is a regex.
+fn is_glob(word: &str) -> bool {
+    let chars: Vec<char> = word.chars().collect();
+    chars.iter().enumerate().any(|(i, &c)| {
+        c == '*' && (i == 0 || !matches!(chars[i - 1], '.' | ')' | ']' | '\\' | '*'))
+    })
+}
+
+fn word_regex(word: &str) -> Option<Regex> {
+    let source = if is_glob(word) {
+        generated::glob_pattern(word)?
+    } else {
+        word.to_string()
+    };
+    RegexBuilder::new(&source)
+        .case_insensitive(true)
+        .build()
+        .ok()
+}
+/// The `/` filter. Each whitespace-separated word is a case-insensitive
+/// glob or regex, and a path has to match all of them; a word that is
+/// neither (yet — say, halfway through typing a group) is matched as text.
+#[derive(Debug, Default)]
+struct Filter {
+    text: String,
+    words: Vec<Regex>,
+    /// Some word didn't parse as a regex and is being matched as text.
+    literal: bool,
+}
+
+impl Filter {
+    #[cfg(test)]
+    fn new(text: &str) -> Self {
+        let mut filter = Filter::default();
+        filter.set(text.to_string());
+        filter
+    }
+
+    fn set(&mut self, text: String) {
+        self.literal = false;
+        self.words = text
+            .split_whitespace()
+            .filter_map(|word| {
+                word_regex(word).or_else(|| {
+                    self.literal = true;
+                    RegexBuilder::new(&regex::escape(word))
+                        .case_insensitive(true)
+                        .build()
+                        .ok()
+                })
+            })
+            .collect();
+        self.text = text;
+    }
+
+    fn push(&mut self, c: char) {
+        let mut text = std::mem::take(&mut self.text);
+        text.push(c);
+        self.set(text);
+    }
+
+    fn pop(&mut self) {
+        let mut text = std::mem::take(&mut self.text);
+        text.pop();
+        self.set(text);
+    }
+
+    fn clear(&mut self) {
+        self.set(String::new());
+    }
+
+    fn is_empty(&self) -> bool {
+        self.text.is_empty()
+    }
+
+    /// Whether the filter narrows anything down at all.
+    fn is_active(&self) -> bool {
+        !self.words.is_empty()
+    }
+
+    fn matches(&self, path: &str) -> bool {
+        self.words.iter().all(|re| re.is_match(path))
+    }
+}
+
 /// One PR's diffs, by path, as GitHub serves them.
 enum Patches {
     Loading,
@@ -237,7 +341,11 @@ pub struct FilesView {
     table: TableState,
     status: Option<String>,
     /// Generated files waiting on a yes / no before they're marked viewed.
-    confirm: Option<Vec<usize>>,
+    confirm: Option<Confirm>,
+    /// `/`: only files whose path contains every word of this.
+    filter: Filter,
+    /// Typing the filter: keys go into it.
+    filtering: bool,
     ledger: Ledger,
     /// `None` only in tests, where nothing should reach GitHub.
     worker: Option<Worker>,
@@ -270,6 +378,52 @@ impl FilesView {
 
     fn file_visible(&self, file: usize) -> bool {
         !(self.hide_viewed && self.files[file].viewed == ViewedState::Viewed)
+            && self.filter.matches(&self.files[file].path)
+    }
+
+    /// Files in scope that match the filter, viewed or not.
+    fn matching(&self) -> Vec<usize> {
+        self.dirs[self.view_root()]
+            .all_files
+            .iter()
+            .copied()
+            .filter(|&f| self.filter.matches(&self.files[f].path))
+            .collect()
+    }
+
+    fn filter_key(&mut self, code: KeyCode) {
+        match code {
+            KeyCode::Enter => self.filtering = false,
+            KeyCode::Esc => {
+                self.filtering = false;
+                self.filter.clear();
+            }
+            KeyCode::Backspace => {
+                self.filter.pop();
+            }
+            KeyCode::Down => return self.move_by(1),
+            KeyCode::Up => return self.move_by(-1),
+            KeyCode::Char(c) => self.filter.push(c),
+            _ => return,
+        }
+        self.table.select(Some(0));
+        self.clamp();
+    }
+
+    /// `V` while filtering: every match at once, after asking.
+    fn ask_to_toggle_matching(&mut self) {
+        let (targets, viewed) = toggle_plan(&self.files, &self.matching());
+        match targets.len() {
+            0 => self.status = Some("no files match".to_string()),
+            1 => self.apply_toggle(&targets),
+            _ => {
+                self.confirm = Some(Confirm {
+                    targets,
+                    viewed,
+                    what: Bulk::Matching(self.filter.text.trim().to_string()),
+                })
+            }
+        }
     }
 
     fn dir_visible(&self, dir: usize) -> bool {
@@ -284,8 +438,22 @@ impl FilesView {
             return self.order_rows();
         }
         let mut rows = Vec::new();
-        self.push_contents(self.view_root(), &mut rows);
+        let root = self.view_root();
+        if self.root_row() {
+            rows.push(RowRef::Dir(root));
+            if self.collapsed.contains(&root) {
+                return rows;
+            }
+        }
+        self.push_contents(root, &mut rows);
         rows
+    }
+
+    /// The tree starts with a row for its root — `/`, or the PR picked
+    /// with `[ ]` — so `V` there covers everything. Not in the All view of
+    /// several PRs, whose top rows are the PRs themselves.
+    fn root_row(&self) -> bool {
+        (self.pr_roots.len() == 1 || self.scope.is_some()) && self.dir_visible(self.view_root())
     }
 
     /// PRs in the current scope, in order.
@@ -424,7 +592,15 @@ impl FilesView {
                 .collect();
         }
         let mut rows = Vec::new();
-        self.push_guided(self.view_root(), "", true, &mut rows);
+        let root = self.view_root();
+        if self.root_row() {
+            rows.push((RowRef::Dir(root), String::new()));
+            if !self.collapsed.contains(&root) {
+                self.push_guided(root, "", false, &mut rows);
+            }
+        } else {
+            self.push_guided(root, "", true, &mut rows);
+        }
         rows
     }
 
@@ -506,6 +682,17 @@ impl FilesView {
             }
             RowRef::File { dir, .. } => self.select_dir(dir),
         }
+    }
+
+    /// A directory's files that the filter lets through, viewed or not —
+    /// what its counts show and what `V` on it covers.
+    fn dir_files(&self, dir: usize) -> Vec<usize> {
+        self.dirs[dir]
+            .all_files
+            .iter()
+            .copied()
+            .filter(|&f| self.filter.matches(&self.files[f].path))
+            .collect()
     }
 
     fn viewed_count(&self, indices: &[usize]) -> usize {
@@ -625,6 +812,8 @@ impl FilesView {
             table: TableState::default(),
             status: None,
             confirm: None,
+            filter: Filter::default(),
+            filtering: false,
             worker: Some(Worker::spawn(pr_ids)),
         };
         view.clamp();
@@ -679,7 +868,7 @@ impl FilesView {
 
     /// True while Esc should close the diff rather than quit.
     pub fn takes_esc(&self) -> bool {
-        self.diff.open
+        self.diff.open || !self.filter.is_empty()
     }
 
     /// A file waiting to be opened with `LAUGH_OPEN_CMD`.
@@ -740,9 +929,10 @@ impl FilesView {
             .collect()
     }
 
-    /// True while the confirmation dialog is open and should get every key.
+    /// True while a dialog is open or the filter is being typed, and every
+    /// key should come here.
     pub fn is_modal(&self) -> bool {
-        self.confirm.is_some()
+        self.confirm.is_some() || self.filtering
     }
 
     fn ask_to_mark_generated(&mut self) {
@@ -750,22 +940,38 @@ impl FilesView {
         if targets.is_empty() {
             self.status = Some("no unviewed generated files here".to_string());
         } else {
-            self.confirm = Some(targets);
+            self.confirm = Some(Confirm {
+                targets,
+                viewed: true,
+                what: Bulk::Generated,
+            });
         }
     }
 
     fn answer_confirm(&mut self, code: KeyCode) {
         match code {
             KeyCode::Char('y') | KeyCode::Enter => {
-                let targets = self.confirm.take().unwrap_or_default();
-                let count = targets.len();
-                let jobs = self.ledger.apply(&mut self.files, &targets, true);
+                let Some(confirm) = self.confirm.take() else {
+                    return;
+                };
+                let jobs = self
+                    .ledger
+                    .apply(&mut self.files, &confirm.targets, confirm.viewed);
                 if let Some(worker) = &self.worker {
                     for job in jobs {
                         worker.send(job);
                     }
                 }
-                self.status = Some(format!("{count} generated file(s) marked viewed"));
+                let count = confirm.targets.len();
+                let how = if confirm.viewed {
+                    "marked viewed"
+                } else {
+                    "unmarked"
+                };
+                self.status = Some(match confirm.what {
+                    Bulk::Generated => format!("{count} generated file(s) {how}"),
+                    Bulk::Matching(q) => format!("{count} file(s) matching “{q}” {how}"),
+                });
                 self.clamp();
             }
             KeyCode::Char('n') | KeyCode::Char('q') | KeyCode::Esc => self.confirm = None,
@@ -775,12 +981,30 @@ impl FilesView {
 
     pub fn handle_key(&mut self, code: KeyCode) {
         self.status = None;
-        if self.is_modal() {
+        if self.confirm.is_some() {
             self.answer_confirm(code);
             return;
         }
+        if self.filtering {
+            self.filter_key(code);
+            return;
+        }
+        if code == KeyCode::Char('/') {
+            self.filtering = true;
+            self.diff.open = false;
+            return;
+        }
+        if code == KeyCode::Esc && !self.diff.open && !self.filter.is_empty() {
+            self.filter.clear();
+            self.clamp();
+            return;
+        }
         if code == KeyCode::Char('m') {
-            self.ask_to_mark_generated();
+            if self.filter.is_active() {
+                self.ask_to_toggle_matching();
+            } else {
+                self.ask_to_mark_generated();
+            }
             return;
         }
         if code == KeyCode::Char('o') {
@@ -834,11 +1058,10 @@ impl FilesView {
                 // On a file, V means "the directory this file sits in".
                 // Files at the repository root have no directory row, so
                 // they fall back to just themselves rather than the whole PR.
+                // With a filter on, only what matches.
                 let targets = match current {
-                    RowRef::Dir(d) => self.dirs[d].all_files.clone(),
-                    RowRef::File { dir, .. } if dir != self.view_root() => {
-                        self.dirs[dir].all_files.clone()
-                    }
+                    RowRef::Dir(d) => self.dir_files(d),
+                    RowRef::File { dir, .. } if dir != self.view_root() => self.dir_files(dir),
                     RowRef::File { file, .. } => vec![file],
                 };
                 self.apply_toggle(&targets);
@@ -876,8 +1099,25 @@ impl FilesView {
         } else {
             ("H", "hide viewed")
         };
-        if self.is_modal() {
-            return vec![("y", "mark them viewed"), ("n", "cancel")];
+        if self.confirm.is_some() {
+            return vec![("y", "yes"), ("n", "cancel")];
+        }
+        if self.filtering {
+            return vec![("type", "filter by path"), ("⏎", "done"), ("esc", "clear")];
+        }
+        if self.filter.is_active() && !self.diff.open {
+            let v = match self.current() {
+                Some(RowRef::Dir(_)) => ("V", "viewed: matches inside"),
+                _ => ("V", "matches in folder"),
+            };
+            return vec![
+                ("v", "this file"),
+                v,
+                ("m", "every match"),
+                ("/", "edit"),
+                ("esc", "clear filter"),
+                hide,
+            ];
         }
         let mut hints = match self.current() {
             Some(RowRef::Dir(_)) => vec![("V", "viewed: everything inside"), ("⏎", "fold"), hide],
@@ -942,13 +1182,29 @@ fn count_cell(n: u64, sign: char, color: ratatui::style::Color) -> Cell<'static>
 
 /// "Mark these N generated files viewed?" — listing what and why, since it
 /// writes to GitHub for files the reviewer hasn't opened.
-fn draw_confirm(f: &mut ratatui::Frame<'_>, area: Rect, app: &FilesView, targets: &[usize]) {
+fn draw_confirm(f: &mut ratatui::Frame<'_>, area: Rect, app: &FilesView, confirm: &Confirm) {
     const SHOWN: usize = 12;
+    let targets = &confirm.targets;
+    let (verb, done) = if confirm.viewed {
+        ("Mark ", " as viewed?")
+    } else {
+        ("Unmark ", " — back to not viewed?")
+    };
+    let (kind, title) = match &confirm.what {
+        Bulk::Generated => (
+            " generated file(s)".to_string(),
+            "Generated files".to_string(),
+        ),
+        Bulk::Matching(q) => (
+            format!(" file(s) matching “{q}”"),
+            format!("Files matching “{q}”"),
+        ),
+    };
     let mut lines = vec![
         Line::from(vec![
-            Span::styled("Mark ", theme::text()),
+            Span::styled(verb, theme::text()),
             Span::styled(format!("{}", targets.len()), theme::bold(theme::accent())),
-            Span::styled(" generated file(s) as viewed?", theme::text()),
+            Span::styled(format!("{kind}{done}"), theme::text()),
         ]),
         Line::raw(""),
     ];
@@ -973,7 +1229,17 @@ fn draw_confirm(f: &mut ratatui::Frame<'_>, area: Rect, app: &FilesView, targets
     }
     lines.push(Line::raw(""));
     let mut keys = vec![Span::raw("  ")];
-    keys.extend(ui::key_hints(&[("y", "mark them viewed"), ("n", "cancel")]));
+    keys.extend(ui::key_hints(&[
+        (
+            "y",
+            if confirm.viewed {
+                "mark them viewed"
+            } else {
+                "unmark them"
+            },
+        ),
+        ("n", "cancel"),
+    ]));
     lines.push(Line::from(keys));
 
     let width = lines
@@ -985,10 +1251,7 @@ fn draw_confirm(f: &mut ratatui::Frame<'_>, area: Rect, app: &FilesView, targets
         .clamp(44, area.width.saturating_sub(4));
     let popup = ui::centered(area, width, lines.len() as u16 + 2);
     f.render_widget(Clear, popup);
-    f.render_widget(
-        Paragraph::new(lines).block(ui::panel("Generated files", true)),
-        popup,
-    );
+    f.render_widget(Paragraph::new(lines).block(ui::panel(&title, true)), popup);
 }
 
 /// The selected file's diff, beside the tree.
@@ -1077,6 +1340,27 @@ fn draw(f: &mut ratatui::Frame<'_>, area: Rect, app: &mut FilesView) {
         summary.push(Span::raw("   "));
         summary.push(Span::styled(" hiding viewed ", theme::pill_on()));
     }
+    if app.filtering || !app.filter.is_empty() {
+        summary.push(Span::raw("   "));
+        summary.push(Span::styled(" / ", theme::pill_on()));
+        summary.push(Span::styled(
+            format!(" {}", app.filter.text),
+            theme::bold(theme::text()),
+        ));
+        if app.filtering {
+            summary.push(Span::styled("▏", theme::accent()));
+        }
+        summary.push(Span::styled(
+            format!("  {} match", app.matching().len()),
+            theme::muted(),
+        ));
+        if app.filter.literal {
+            summary.push(Span::styled(
+                "  · not a valid regex, matched as text",
+                Style::default().fg(theme::YELLOW),
+            ));
+        }
+    }
     if app.order_mode {
         summary.push(Span::raw("   "));
         summary.push(Span::styled(" reading order ", theme::pill_on()));
@@ -1088,11 +1372,10 @@ fn draw(f: &mut ratatui::Frame<'_>, area: Rect, app: &mut FilesView) {
     f.render_widget(Paragraph::new(Line::from(summary)), summary_area);
 
     // Pad both sides of `done/total` to the widest total any directory row
-    // shows (the root itself is never a row), so the slashes line up.
+    // shows, so the slashes line up.
     let digits = app
         .dirs
         .iter()
-        .skip(1)
         .map(|d| d.all_files.len().to_string().len())
         .max()
         .unwrap_or(1);
@@ -1106,20 +1389,23 @@ fn draw(f: &mut ratatui::Frame<'_>, area: Rect, app: &mut FilesView) {
             match r {
                 RowRef::Dir(d) => {
                     let node = &app.dirs[d];
-                    let done = app.viewed_count(&node.all_files);
-                    let total = node.all_files.len();
+                    let shown = app.dir_files(d);
+                    let done = app.viewed_count(&shown);
+                    let total = shown.len();
                     let fold = if app.collapsed.contains(&d) {
                         "▸ "
                     } else {
                         "▾ "
                     };
-                    let (adds, dels) = node.all_files.iter().fold((0, 0), |(a, d), &i| {
+                    let (adds, dels) = shown.iter().fold((0, 0), |(a, d), &i| {
                         (a + app.files[i].additions, d + app.files[i].deletions)
                     });
                     let mut name = vec![guide, Span::styled(fold, theme::muted())];
                     if node.pr_root {
                         name.push(Span::styled("▣ ", Style::default().fg(theme::BRAND)));
                         name.push(Span::styled(node.label.clone(), theme::bold(theme::text())));
+                    } else if d == ROOT {
+                        name.push(Span::styled("/", theme::bold(theme::accent())));
                     } else {
                         name.push(Span::styled(
                             node.label.clone(),
@@ -1215,8 +1501,8 @@ fn draw(f: &mut ratatui::Frame<'_>, area: Rect, app: &mut FilesView) {
         draw_diff(f, diff_area, app);
     }
 
-    if let Some(targets) = &app.confirm {
-        draw_confirm(f, area, app, targets);
+    if let Some(confirm) = &app.confirm {
+        draw_confirm(f, area, app, confirm);
     }
 }
 
@@ -1319,6 +1605,8 @@ mod tests {
             table: TableState::default(),
             status: None,
             confirm: None,
+            filter: Filter::default(),
+            filtering: false,
             worker: None,
             sources: Vec::new(),
             file_dir: Vec::new(),
@@ -1336,6 +1624,7 @@ mod tests {
         a.rows()
             .into_iter()
             .map(|r| match r {
+                RowRef::Dir(ROOT) => "/".to_string(),
                 RowRef::Dir(d) => a.dirs[d].label.clone(),
                 RowRef::File { file, .. } => a.files[file].file_name().to_string(),
             })
@@ -1345,7 +1634,7 @@ mod tests {
     #[test]
     fn rows_walk_the_tree_directories_before_files() {
         let a = app(files(&["a/b/x.ts", "a/z.ts", "root.md"]), false);
-        assert_eq!(row_labels(&a), ["a/", "b/", "x.ts", "z.ts", "root.md"]);
+        assert_eq!(row_labels(&a), ["/", "a/", "b/", "x.ts", "z.ts", "root.md"]);
     }
 
     #[test]
@@ -1358,7 +1647,7 @@ mod tests {
             ],
             true,
         );
-        assert_eq!(row_labels(&a), ["a/", "todo/", "y.ts"]);
+        assert_eq!(row_labels(&a), ["/", "a/", "todo/", "y.ts"]);
     }
 
     #[test]
@@ -1368,11 +1657,22 @@ mod tests {
         let order: Vec<RowRef> = guided.iter().map(|(r, _)| *r).collect();
         assert_eq!(order, a.rows());
         let guides: Vec<&str> = guided.iter().map(|(_, g)| g.as_str()).collect();
-        // a/ ─┬ b/ ─┬ x.ts
-        //     │     └ y.ts
-        //     └ z.ts
-        // root.md
-        assert_eq!(guides, ["", "├─ ", "│  ├─ ", "│  └─ ", "└─ ", ""]);
+        // / ─┬ a/ ─┬ b/ ─┬ x.ts
+        //    │     │     └ y.ts
+        //    │     └ z.ts
+        //    └ root.md
+        assert_eq!(
+            guides,
+            [
+                "",
+                "├─ ",
+                "│  ├─ ",
+                "│  │  ├─ ",
+                "│  │  └─ ",
+                "│  └─ ",
+                "└─ "
+            ]
+        );
     }
 
     #[test]
@@ -1380,7 +1680,7 @@ mod tests {
         let mut a = app(files(&["a/b/x.ts", "a/z.ts", "root.md"]), false);
         let a_dir = a.dirs[ROOT].subdirs[0];
         a.collapsed.insert(a_dir);
-        assert_eq!(row_labels(&a), ["a/", "root.md"]);
+        assert_eq!(row_labels(&a), ["/", "a/", "root.md"]);
     }
 
     #[test]
@@ -1412,6 +1712,8 @@ mod tests {
             table: TableState::default(),
             status: None,
             confirm: None,
+            filter: Filter::default(),
+            filtering: false,
             worker: None,
             sources: Vec::new(),
             file_dir: Vec::new(),
@@ -1447,7 +1749,11 @@ mod tests {
     fn scoping_to_one_pr_shows_just_its_tree_and_counts() {
         let mut a = multi_pr_app();
         a.set_scope(Some(1));
-        assert_eq!(row_labels(&a), ["terraform/", "main.tf", "README.md"]);
+        assert_eq!(
+            row_labels(&a),
+            ["infra#2", "terraform/", "main.tf", "README.md"],
+            "a single PR's tree starts at its own row"
+        );
         assert_eq!(a.viewed_counts(), (0, 2));
     }
 
@@ -1468,7 +1774,10 @@ mod tests {
         let mut a = app(fs, false);
         a.handle_key(KeyCode::Char('m'));
         // In tree order: the snapshot's directory comes before root files.
-        assert_eq!(a.confirm.as_deref(), Some(&[2, 1][..]));
+        assert_eq!(
+            a.confirm.as_ref().map(|c| c.targets.as_slice()),
+            Some(&[2, 1][..])
+        );
         a.handle_key(KeyCode::Char('n'));
         assert!(a.confirm.is_none());
         assert_eq!(
@@ -1524,7 +1833,7 @@ mod tests {
     #[test]
     fn enter_on_a_file_opens_the_diff_and_esc_closes_it() {
         let mut a = app(files(&["src/a.rs", "src/b.rs"]), false);
-        a.table.select(Some(1));
+        a.table.select(Some(2));
         assert_eq!(a.selected_file(), Some(0));
         a.handle_key(KeyCode::Enter);
         assert!(a.takes_esc(), "the diff is open");
@@ -1540,12 +1849,139 @@ mod tests {
     #[test]
     fn the_wheel_scrolls_the_diff_under_the_pointer_and_moves_the_cursor_elsewhere() {
         let mut a = app(files(&["src/a.rs", "src/b.rs"]), false);
-        a.table.select(Some(1));
+        a.table.select(Some(2));
         a.handle_key(KeyCode::Enter);
         a.diff.area = Some(Rect::new(40, 0, 60, 20));
         a.wheel(true, Position::new(50, 5));
         assert_eq!((a.diff.scroll, a.selected_file()), (3, Some(0)));
         a.wheel(true, Position::new(10, 5));
         assert_eq!((a.diff.scroll, a.selected_file()), (3, Some(1)));
+    }
+
+    #[test]
+    fn slash_filters_by_path_and_m_marks_every_match_after_asking() {
+        let mut a = app(
+            files(&["src/a.spec.ts", "src/a.ts", "lib/b.spec.ts", "README.md"]),
+            false,
+        );
+        a.handle_key(KeyCode::Char('/'));
+        assert!(a.is_modal(), "typing goes to the filter");
+        for c in "SPEC".chars() {
+            a.handle_key(KeyCode::Char(c));
+        }
+        a.handle_key(KeyCode::Enter);
+        assert!(!a.is_modal());
+        let mut shown: Vec<usize> = a
+            .rows()
+            .into_iter()
+            .filter_map(|r| match r {
+                RowRef::File { file, .. } => Some(file),
+                RowRef::Dir(_) => None,
+            })
+            .collect();
+        shown.sort();
+        assert_eq!(shown, [0, 2], "case-insensitive, any depth");
+
+        a.handle_key(KeyCode::Char('m'));
+        let confirm = a.confirm.as_ref().expect("asks first");
+        assert_eq!(confirm.what, Bulk::Matching("SPEC".into()));
+        a.handle_key(KeyCode::Char('y'));
+        let viewed: Vec<bool> = a
+            .files
+            .iter()
+            .map(|f| f.viewed == ViewedState::Viewed)
+            .collect();
+        assert_eq!(viewed, [true, false, true, false]);
+
+        assert!(a.takes_esc());
+        a.handle_key(KeyCode::Esc);
+        assert!(
+            a.filter.is_empty() && !a.takes_esc(),
+            "esc clears the filter"
+        );
+    }
+
+    #[test]
+    fn every_word_of_the_filter_must_appear() {
+        assert!(Filter::new("web spec").matches("apps/web/src/Button.spec.ts"));
+        assert!(!Filter::new("web spec").matches("apps/api/src/Button.spec.ts"));
+        assert!(Filter::new("  ").matches("anything"));
+        assert!(!Filter::new("  ").is_active());
+    }
+
+    #[test]
+    fn words_are_regexes_and_broken_ones_match_as_text() {
+        let f = Filter::new(r"^apps/(web|api)/.*\.SPEC\.ts$");
+        assert!(f.matches("apps/api/src/Button.spec.ts"));
+        assert!(!f.matches("apps/admin/src/Button.spec.ts"));
+        assert!(!f.matches("apps/api/src/Button.spec.tsx"));
+        assert!(!f.literal);
+
+        let glob = Filter::new("*.spec.ts");
+        assert!(!glob.literal);
+        assert!(glob.matches("apps/web/src/Button.SPEC.ts"));
+        assert!(!glob.matches("apps/web/src/Button.ts"));
+        assert!(!glob.matches("apps/web/src/Button.spec.tsx"));
+        let rooted = Filter::new("apps/**/*.ts");
+        assert!(rooted.matches("apps/web/src/a.ts"));
+        assert!(!rooted.matches("lib/apps/a.ts"));
+        assert!(is_glob("src/*/index.ts"));
+        assert!(!is_glob(r".*\.ts$"));
+        assert!(!is_glob("(a|b)*"));
+
+        let half = Filter::new("(web");
+        assert!(half.literal);
+        assert!(half.matches("x/(web)/y"));
+        assert!(!half.matches("apps/web/a.ts"));
+    }
+
+    #[test]
+    fn with_a_filter_v_on_a_folder_covers_only_its_matches() {
+        let mut a = app(
+            files(&["src/a.spec.ts", "src/a.ts", "lib/b.spec.ts"]),
+            false,
+        );
+        a.filter.set("*.spec.ts".to_string());
+        a.clamp();
+        let src = a
+            .rows()
+            .iter()
+            .position(|r| matches!(r, RowRef::Dir(d) if label_of(&a.dirs, *d) == "src/"))
+            .expect("src/ is shown");
+        a.table.select(Some(src));
+        a.handle_key(KeyCode::Char('V'));
+        assert!(
+            a.confirm.is_none(),
+            "V on a folder doesn't ask, as without a filter"
+        );
+        let viewed: Vec<bool> = a
+            .files
+            .iter()
+            .map(|f| f.viewed == ViewedState::Viewed)
+            .collect();
+        assert_eq!(viewed, [true, false, false], "not src/a.ts, not lib/");
+        let RowRef::Dir(d) = a.rows()[src] else {
+            unreachable!()
+        };
+        assert_eq!(a.dir_files(d), [0], "its count is of matches only");
+    }
+
+    #[test]
+    fn v_on_the_root_row_covers_the_whole_pr_and_only_matches_when_filtered() {
+        let mut a = app(files(&["src/a.spec.ts", "src/a.ts", "README.md"]), false);
+        a.clamp();
+        assert_eq!(a.current(), Some(RowRef::Dir(ROOT)), "the tree opens on /");
+        a.filter.set("*.ts".to_string());
+        a.handle_key(KeyCode::Char('V'));
+        let viewed = |a: &FilesView| -> Vec<bool> {
+            a.files
+                .iter()
+                .map(|f| f.viewed == ViewedState::Viewed)
+                .collect()
+        };
+        assert_eq!(viewed(&a), [true, true, false]);
+        a.filter.clear();
+        a.handle_key(KeyCode::Char('V'));
+        assert_eq!(viewed(&a), [true, true, true]);
     }
 }
