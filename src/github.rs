@@ -421,9 +421,8 @@ query($owner: String!, $repo: String!, $pr: Int!) {
       commits(last: 1) { nodes { commit { statusCheckRollup { contexts(first: 100) { nodes {
         __typename
         ... on CheckRun {
-          databaseId name status conclusion detailsUrl
+          id databaseId name status conclusion detailsUrl
           checkSuite { app { name slug } workflowRun { workflow { name } } }
-          steps(first: 100) { nodes { name conclusion } }
           annotations(first: 50) { nodes { path annotationLevel message location { start { line } } } }
         }
         ... on StatusContext { context state targetUrl }
@@ -463,6 +462,7 @@ struct Rollup {
 #[serde(tag = "__typename")]
 enum RawContext {
     CheckRun {
+        id: Option<String>,
         #[serde(rename = "databaseId")]
         database_id: Option<u64>,
         name: String,
@@ -472,6 +472,9 @@ enum RawContext {
         details_url: Option<String>,
         #[serde(rename = "checkSuite")]
         check_suite: Option<CheckSuite>,
+        /// Not in the checks query (it makes it several times slower);
+        /// filled in afterwards for failed runs only.
+        #[serde(default)]
         steps: Option<Nodes<RawStep>>,
         annotations: Option<Nodes<RawAnnotation>>,
     },
@@ -535,6 +538,7 @@ impl From<RawContext> for Check {
     fn from(raw: RawContext) -> Self {
         match raw {
             RawContext::CheckRun {
+                id: _,
                 database_id,
                 name,
                 status,
@@ -608,20 +612,79 @@ pub fn fetch_checks(owner: &str, repo: &str, pr: u64) -> Result<Vec<Check>> {
         ],
     )?;
     let pull_request = pull_request_of(data, owner, repo, pr)?;
-    let mut checks: Vec<Check> = pull_request
+    let mut contexts: Vec<RawContext> = pull_request
         .commits
         .nodes
         .into_iter()
         .filter_map(|c| c.commit.rollup)
         .flat_map(|r| r.contexts.nodes)
-        .map(Check::from)
         .collect();
+    fill_failed_steps(&mut contexts)?;
+    let mut checks: Vec<Check> = contexts.into_iter().map(Check::from).collect();
     for check in &mut checks {
         // What failed before what merely warned.
         check.annotations.sort_by_key(|a| a.level != "failure");
     }
     checks.sort_by(|a, b| a.state.cmp(&b.state).then_with(|| a.source.cmp(&b.source)));
     Ok(checks)
+}
+
+/// Fetches the steps of the failed check runs among `contexts`, for the
+/// step that failed. Asking for every run's steps in the checks query costs
+/// seconds on a PR with dozens of jobs; the failures are usually a few.
+fn fill_failed_steps(contexts: &mut [RawContext]) -> Result<()> {
+    #[derive(Deserialize)]
+    struct StepsData {
+        nodes: Vec<Option<StepsNode>>,
+    }
+    #[derive(Deserialize)]
+    struct StepsNode {
+        id: Option<String>,
+        steps: Option<Nodes<RawStep>>,
+    }
+    let failed: Vec<String> = contexts
+        .iter()
+        .filter_map(|c| match c {
+            RawContext::CheckRun {
+                id: Some(id),
+                status,
+                conclusion,
+                ..
+            } if CheckState::from_github(status.as_deref(), conclusion.as_deref())
+                == CheckState::Failed =>
+            {
+                Some(id.clone())
+            }
+            _ => None,
+        })
+        .collect();
+    if failed.is_empty() {
+        return Ok(());
+    }
+    let vars: Vec<Var> = failed.iter().map(|id| Var::String("ids[]", id)).collect();
+    let data: StepsData = graphql(
+        "query($ids: [ID!]!) {
+           nodes(ids: $ids) { ... on CheckRun { id steps(first: 100) { nodes { name conclusion } } } }
+         }",
+        &vars,
+    )?;
+    let mut by_id: HashMap<String, Nodes<RawStep>> = data
+        .nodes
+        .into_iter()
+        .flatten()
+        .filter_map(|n| Some((n.id?, n.steps?)))
+        .collect();
+    for context in contexts {
+        if let RawContext::CheckRun {
+            id: Some(id),
+            steps,
+            ..
+        } = context
+        {
+            *steps = by_id.remove(id.as_str());
+        }
+    }
+    Ok(())
 }
 
 /// Every changed file's unified diff, by path, from the REST files list.
