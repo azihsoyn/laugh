@@ -125,6 +125,24 @@ changed functions call which, and puts what's used before what uses it
 (`uses index.ts`, `used by client.ts`). The header says which order you got.
 `v`, `V` and `H` work the same in either view.
 
+`⏎` on a file shows its diff beside the tree — GitHub's own, so it works
+without a checkout. `J` / `K` scroll it, moving the cursor follows it to the
+next file, and `Esc` closes it.
+
+To open files your own way instead, set `LAUGH_OPEN_CMD`. `⏎` then runs it
+with `sh -c`, handing it the terminal until it exits, so a pager or an
+editor works. The path is `$1` and `$LAUGH_FILE`, alongside `$LAUGH_REPO`
+(`owner/repo`), `$LAUGH_PR`, `$LAUGH_BASE` / `$LAUGH_HEAD` (commit SHAs) and
+`$LAUGH_URL`. Run laugh inside the checkout for anything that reads it:
+
+```sh
+# the PR's diff of that file, with your git diff tool; -+F keeps less open
+# even when the diff fits on one screen
+export LAUGH_OPEN_CMD='git diff --color=always "$LAUGH_BASE...$LAUGH_HEAD" -- "$1" | less -R -+F'
+# the file itself, in your editor
+export LAUGH_OPEN_CMD='${EDITOR:-vi} "$1"'
+```
+
 ### 2 · Threads
 
 Every review thread — open, resolved and outdated — as a row of cards. The
@@ -190,6 +208,8 @@ link.
 | `H` | hide / show viewed files |
 | `m` | viewed: every generated file (asks first) |
 | `o` | reading order / tree |
+| `⏎` on a file | its diff (or `LAUGH_OPEN_CMD`) |
+| `J` `K` · `Esc` | scroll the diff · close it |
 
 | Threads | |
 |---|---|

@@ -1,3 +1,4 @@
+use std::process::Command;
 use std::time::Duration;
 
 use anyhow::Result;
@@ -8,8 +9,8 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Clear, Paragraph};
 
 use crate::checks_view::ChecksView;
-use crate::files_view::FilesView;
-use crate::term::{Term, with_terminal};
+use crate::files_view::{FilesView, OpenRequest};
+use crate::term::{self, Term, with_terminal};
 use crate::threads_view::ThreadsView;
 use crate::{theme, ui};
 
@@ -134,6 +135,11 @@ fn event_loop(terminal: &mut Term, app: &mut PrApp) -> Result<()> {
             app.files.handle_key(key.code);
             continue;
         }
+        // With a diff open, Esc closes it rather than quitting.
+        if app.screen == Screen::Files && key.code == KeyCode::Esc && app.files.takes_esc() {
+            app.files.handle_key(key.code);
+            continue;
+        }
         match key.code {
             KeyCode::Char('q') | KeyCode::Esc => return Ok(()),
             KeyCode::Char('?') => app.help = true,
@@ -143,12 +149,52 @@ fn event_loop(terminal: &mut Term, app: &mut PrApp) -> Result<()> {
             KeyCode::Char(']') => app.cycle_scope(1),
             KeyCode::Char('[') => app.cycle_scope(-1),
             code => match app.screen {
-                Screen::Files => app.files.handle_key(code),
+                Screen::Files => {
+                    app.files.handle_key(code);
+                    if let Some(request) = app.files.take_open_request() {
+                        let status = open_externally(terminal, app, &request)?;
+                        app.files.set_status(status);
+                    }
+                }
                 Screen::Threads => app.threads.handle_key(code),
                 Screen::Checks => app.checks.handle_key(code),
             },
         }
     }
+}
+
+/// Runs `LAUGH_OPEN_CMD` for a file with the terminal handed over, so a
+/// pager or an editor works; one that opens somewhere else returns at once.
+/// The file and its PR are in the environment, and the path is also `$1`.
+fn open_externally(terminal: &mut Term, app: &PrApp, request: &OpenRequest) -> Result<String> {
+    let Some(cmd) = app.files.open_cmd() else {
+        return Ok(String::new());
+    };
+    term::suspend(terminal)?;
+    let status = Command::new("sh")
+        .arg("-c")
+        .arg(cmd)
+        .arg("laugh")
+        .arg(&request.path)
+        .env("LAUGH_FILE", &request.path)
+        .env("LAUGH_REPO", format!("{}/{}", request.owner, request.repo))
+        .env("LAUGH_PR", request.number.to_string())
+        .env("LAUGH_BASE", &request.base)
+        .env("LAUGH_HEAD", &request.head)
+        .env(
+            "LAUGH_URL",
+            format!(
+                "https://github.com/{}/{}/pull/{}/files",
+                request.owner, request.repo, request.number
+            ),
+        )
+        .status();
+    term::resume(terminal)?;
+    Ok(match status {
+        Ok(s) if s.success() => format!("opened {}", request.path),
+        Ok(s) => format!("LAUGH_OPEN_CMD exited with {}", s.code().unwrap_or(-1)),
+        Err(e) => format!("couldn't run LAUGH_OPEN_CMD: {e}"),
+    })
 }
 
 fn tab_at(hits: &[(Screen, Rect)], at: Position) -> Option<Screen> {
@@ -180,7 +226,7 @@ fn handle_mouse(app: &mut PrApp, kind: MouseEventKind, at: Position) {
                 KeyCode::Up
             };
             match app.screen {
-                Screen::Files => app.files.handle_key(code),
+                Screen::Files => app.files.wheel(kind == MouseEventKind::ScrollDown, at),
                 Screen::Threads => app.threads.handle_key(code),
                 Screen::Checks => app.checks.handle_key(code),
             }
@@ -385,6 +431,8 @@ const HELP: &[(&str, &[(&str, &str)])] = &[
         &[
             ("j  k", "move"),
             ("h  l  ⏎", "fold, unfold, step out"),
+            ("⏎", "on a file: its diff (or LAUGH_OPEN_CMD)"),
+            ("J  K  esc", "scroll the diff · close it"),
             ("v", "viewed: this file"),
             ("V", "viewed: everything in the folder"),
             ("H", "hide / show viewed files"),

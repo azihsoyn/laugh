@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::process::Command;
 
 use anyhow::{Context, Result, bail};
@@ -617,6 +618,40 @@ pub fn fetch_checks(owner: &str, repo: &str, pr: u64) -> Result<Vec<Check>> {
     }
     checks.sort_by(|a, b| a.state.cmp(&b.state).then_with(|| a.source.cmp(&b.source)));
     Ok(checks)
+}
+
+/// Every changed file's unified diff, by path, from the REST files list.
+/// GitHub leaves `patch` out for binary files and very large diffs.
+pub fn fetch_patches(owner: &str, repo: &str, pr: u64) -> Result<HashMap<String, Option<String>>> {
+    #[derive(Deserialize)]
+    struct File {
+        filename: String,
+        patch: Option<String>,
+    }
+    let output = Command::new("gh")
+        .args([
+            "api",
+            "--paginate",
+            &format!("repos/{owner}/{repo}/pulls/{pr}/files?per_page=100"),
+            "--jq",
+            ".[] | {filename, patch}",
+        ])
+        .output()
+        .context("failed to run `gh`")?;
+    if !output.status.success() {
+        bail!(
+            "couldn't fetch the diff: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| {
+            let f: File = serde_json::from_str(l).context("unexpected files response")?;
+            Ok((f.filename, f.patch))
+        })
+        .collect()
 }
 
 /// The raw log of a GitHub Actions job.

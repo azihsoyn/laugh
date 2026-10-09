@@ -7,6 +7,8 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Padding};
 
+use unicode_width::UnicodeWidthStr;
+
 use crate::theme;
 
 /// A rounded panel; the border lights up in the accent colour when focused.
@@ -199,6 +201,71 @@ pub fn markdown(text: &str) -> Vec<Line<'static>> {
         }
     }
     lines
+}
+
+/// Parses `@@ -769,8 +800,16 @@` into the old and new starting lines.
+pub fn hunk_start(header: &str) -> Option<(i64, i64)> {
+    let mut parts = header.split_whitespace().skip(1);
+    let number = |p: &str| p[1..].split(',').next()?.parse::<i64>().ok();
+    let old = number(parts.next()?)?;
+    let new = number(parts.next()?)?;
+    Some((old, new))
+}
+
+/// A unified diff (one hunk or a whole file's patch) with a gutter of new
+/// line numbers and added / removed lines tinted, padded to `width` so the
+/// tints run the full width of the pane. Returns the lines and each one's
+/// new line number, where it has one.
+pub fn diff_lines(diff: &str, width: usize) -> (Vec<Line<'static>>, Vec<Option<i64>>) {
+    let mut new = 0;
+    let mut lines = Vec::new();
+    let mut numbered = Vec::new();
+    for raw in diff.lines() {
+        if raw.starts_with("@@") {
+            if let Some((_, n)) = hunk_start(raw) {
+                new = n;
+            }
+            lines.push(Line::from(Span::styled(raw.to_string(), theme::faint())));
+            numbered.push(None);
+            continue;
+        }
+        if raw.starts_with('\\') {
+            // "\ No newline at end of file"
+            lines.push(Line::from(Span::styled(
+                format!("       {raw}"),
+                theme::faint(),
+            )));
+            numbered.push(None);
+            continue;
+        }
+        let (marker, rest) = raw.split_at(raw.chars().next().map_or(0, char::len_utf8));
+        let (number, bg, marker_color) = match marker {
+            "+" => {
+                new += 1;
+                (Some(new - 1), Some(theme::ADDED_BG), theme::GREEN)
+            }
+            "-" => (None, Some(theme::REMOVED_BG), theme::RED),
+            _ => {
+                new += 1;
+                (Some(new - 1), None, theme::FAINT)
+            }
+        };
+        let gutter = number.map_or("     ".to_string(), |n| format!("{n:>4} "));
+        let used = gutter.width() + 2 + rest.width();
+        let pad = " ".repeat(width.saturating_sub(used));
+        let line = Line::from(vec![
+            Span::styled(gutter, theme::faint()),
+            Span::styled(format!("{marker} "), Style::default().fg(marker_color)),
+            Span::styled(rest.to_string(), theme::text()),
+            Span::raw(pad),
+        ]);
+        lines.push(match bg {
+            Some(bg) => line.style(Style::default().bg(bg)),
+            None => line,
+        });
+        numbered.push(number);
+    }
+    (lines, numbered)
 }
 
 #[cfg(test)]
