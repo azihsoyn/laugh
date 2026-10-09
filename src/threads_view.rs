@@ -1,10 +1,11 @@
 use std::cell::Cell;
 
 use crossterm::event::KeyCode;
-use ratatui::layout::{Constraint, Layout, Rect};
+use ratatui::layout::{Constraint, Layout, Position, Rect};
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, BorderType, Borders, Paragraph, Wrap};
+use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph};
+use unicode_width::UnicodeWidthStr;
 
 use crate::format::{clean_body, snippet};
 use crate::handoff;
@@ -144,6 +145,12 @@ pub struct ThreadsView {
     /// Where that automatic position currently is, so the first manual
     /// scroll continues from it instead of jumping to the top.
     code_auto_scroll: Cell<u16>,
+    /// How far each pane can scroll, from the last draw.
+    thread_max_scroll: Cell<u16>,
+    code_max_scroll: Cell<u16>,
+    /// Where the panes were last drawn, for the wheel.
+    thread_area: Cell<Option<Rect>>,
+    code_area: Cell<Option<Rect>>,
 }
 
 impl ThreadsView {
@@ -164,6 +171,10 @@ impl ThreadsView {
             thread_scroll: 0,
             code_scroll: None,
             code_auto_scroll: Cell::new(0),
+            thread_max_scroll: Cell::new(u16::MAX),
+            code_max_scroll: Cell::new(u16::MAX),
+            thread_area: Cell::new(None),
+            code_area: Cell::new(None),
         };
         view.clamp_selection();
         view
@@ -258,16 +269,40 @@ impl ThreadsView {
     }
 
     fn scroll_focused(&mut self, delta: i32) {
-        match self.focus {
+        self.scroll(self.focus, delta);
+    }
+
+    fn scroll(&mut self, pane: Pane, delta: i32) {
+        match pane {
             Pane::Thread => {
-                self.thread_scroll = self.thread_scroll.saturating_add_signed(delta as i16);
+                self.thread_scroll = self
+                    .thread_scroll
+                    .saturating_add_signed(delta as i16)
+                    .min(self.thread_max_scroll.get());
             }
             Pane::Code => {
                 let from = self
                     .code_scroll
                     .unwrap_or_else(|| self.code_auto_scroll.get());
-                self.code_scroll = Some(from.saturating_add_signed(delta as i16));
+                self.code_scroll = Some(
+                    from.saturating_add_signed(delta as i16)
+                        .min(self.code_max_scroll.get()),
+                );
             }
+        }
+    }
+
+    /// The wheel scrolls whichever pane is under the pointer, whatever has
+    /// the keyboard; elsewhere (the cards) it scrolls the focused one.
+    pub fn wheel(&mut self, down: bool, at: Position) {
+        let delta = if down { 3 } else { -3 };
+        let over = |area: &Cell<Option<Rect>>| area.get().is_some_and(|a| a.contains(at));
+        if over(&self.code_area) {
+            self.scroll(Pane::Code, delta);
+        } else if over(&self.thread_area) {
+            self.scroll(Pane::Thread, delta);
+        } else {
+            self.scroll_focused(delta.signum());
         }
     }
 }
@@ -329,8 +364,8 @@ impl ThreadsView {
                 self.selected = len.checked_sub(1);
                 self.reset_scroll();
             }
-            KeyCode::Tab => self.switch_tab(1),
-            KeyCode::BackTab => self.switch_tab(-1),
+            KeyCode::Char('p') => self.switch_tab(1),
+            KeyCode::Char('P') => self.switch_tab(-1),
             KeyCode::Char(' ') | KeyCode::Enter => self.focus = self.focus.toggled(),
             KeyCode::Char('f') => {
                 self.state_filter = self.state_filter.cycle();
@@ -355,7 +390,7 @@ impl ThreadsView {
             ("←→", "thread"),
             ("↑↓", "scroll"),
             ("space", "code ⇄ thread"),
-            ("tab", "person"),
+            ("p P", "person"),
             ("a", "to agent"),
             resolved,
         ]
@@ -564,36 +599,155 @@ fn draw_thread_content(f: &mut ratatui::Frame<'_>, area: Rect, app: &ThreadsView
         app.visible_indices().len()
     );
 
+    app.thread_area.set(Some(area));
+    let block = ui::panel(&position, focused);
+    let inner = block.inner(area);
+    let width = inner.width as usize;
     let mut lines: Vec<Line> = vec![Line::from(state_badge(thread)), Line::raw("")];
-    for comment in &thread.comments {
-        let who = if comment.author_is_bot {
-            theme::muted()
-        } else {
-            theme::accent()
-        };
-        let mut header = vec![
-            Span::styled("● ", who),
-            Span::styled(comment.author.clone(), theme::bold(who)),
-        ];
-        if comment.author_is_bot {
-            header.push(Span::styled(" bot", theme::faint()));
-        }
-        if let Some(ts) = &comment.created_at {
-            header.push(Span::styled(
-                format!("  {}", ui::relative_time(ts)),
-                theme::faint(),
-            ));
-        }
-        lines.push(Line::from(header));
-        lines.extend(ui::markdown(&clean_body(&comment.body)));
-        lines.push(Line::raw(""));
-    }
+    let (chat, speakers) = conversation(thread, width);
+    let offset = lines.len();
+    lines.extend(chat);
 
-    let paragraph = Paragraph::new(lines)
-        .block(ui::panel(&position, focused))
-        .wrap(Wrap { trim: false })
-        .scroll((app.thread_scroll, 0));
+    let max = (lines.len() as u16).saturating_sub(inner.height);
+    app.thread_max_scroll.set(max);
+    let scroll = app.thread_scroll.min(max);
+    // Already wrapped to fit, bubble by bubble.
+    let paragraph = Paragraph::new(lines).block(block).scroll((scroll, 0));
     f.render_widget(paragraph, area);
+
+    // Whose bubble the top of the pane is in, once its name has scrolled
+    // out of sight, pinned over the top line.
+    let top = scroll as usize;
+    if let Some(speaker) = speakers
+        .iter()
+        .find(|s| s.first + offset <= top && top <= s.last + offset)
+        && inner.height > 2
+    {
+        let row = Rect { height: 1, ..inner };
+        f.render_widget(Clear, row);
+        f.render_widget(
+            Paragraph::new(speaker.name.clone()).style(Style::default().bg(theme::SELECTION)),
+            row,
+        );
+    }
+}
+
+/// One comment's bubble in the conversation's lines (top and bottom edge),
+/// and its author's name line, to pin while the bubble is in view.
+#[derive(Debug)]
+struct Speaker {
+    first: usize,
+    last: usize,
+    name: Line<'static>,
+}
+
+/// The name line above a bubble: left for others, `you` on the right.
+fn name_line(comment: &crate::model::Comment, width: usize) -> Line<'static> {
+    if comment.viewer_did_author {
+        let label = "you";
+        return Line::from(vec![
+            Span::raw(" ".repeat(width.saturating_sub(label.len()))),
+            Span::styled(label, theme::bold(theme::accent())),
+        ]);
+    }
+    let who = if comment.author_is_bot {
+        theme::muted()
+    } else {
+        theme::accent()
+    };
+    let mut name = vec![Span::styled(comment.author.clone(), theme::bold(who))];
+    if comment.author_is_bot {
+        name.push(Span::styled(" bot", theme::faint()));
+    }
+    Line::from(name)
+}
+
+/// The thread as a chat: each comment in its own bubble, other people's on
+/// the left and the viewer's on the right, as in a messaging app. The name
+/// is shown when the author changes; the time sits on the bubble's bottom
+/// edge.
+fn conversation(thread: &Thread, width: usize) -> (Vec<Line<'static>>, Vec<Speaker>) {
+    // A bubble leaves a little of the pane free on the far side, so the
+    // side it leans to shows even for long comments.
+    let max_outer = width.saturating_sub((width / 10).clamp(2, 6));
+    let max_inner = max_outer.saturating_sub(4).max(1);
+    let mut speakers = Vec::new();
+    let mut lines = Vec::new();
+    let mut last_author: Option<&str> = None;
+    for comment in &thread.comments {
+        let mine = comment.viewer_did_author;
+        let edge = if mine {
+            theme::accent()
+        } else if comment.author_is_bot {
+            theme::faint()
+        } else {
+            theme::muted()
+        };
+
+        let mut body: Vec<Line<'static>> = ui::markdown(&clean_body(&comment.body))
+            .iter()
+            .flat_map(|l| ui::wrap(l, max_inner))
+            .collect();
+        while body.last().is_some_and(|l| l.width() == 0) {
+            body.pop();
+        }
+        if body.is_empty() {
+            body.push(Line::raw(""));
+        }
+        let time = comment
+            .created_at
+            .as_deref()
+            .map(|ts| format!(" {} ", ui::relative_time(ts)))
+            .unwrap_or_default();
+        let inner = body
+            .iter()
+            .map(Line::width)
+            .max()
+            .unwrap_or(0)
+            .max(time.width().saturating_sub(1))
+            .min(max_inner);
+        let outer = inner + 4;
+        let indent = if mine {
+            " ".repeat(width.saturating_sub(outer))
+        } else {
+            String::new()
+        };
+
+        if last_author != Some(comment.author.as_str()) {
+            if last_author.is_some() {
+                lines.push(Line::raw(""));
+            }
+            lines.push(name_line(comment, width));
+        }
+        last_author = Some(comment.author.as_str());
+
+        let first = lines.len();
+        lines.push(Line::from(vec![
+            Span::raw(indent.clone()),
+            Span::styled(format!("╭{}╮", "─".repeat(inner + 2)), edge),
+        ]));
+        for row in body {
+            let pad = inner.saturating_sub(row.width());
+            let mut spans = vec![Span::raw(indent.clone()), Span::styled("│ ", edge)];
+            spans.extend(row.spans);
+            spans.push(Span::raw(" ".repeat(pad)));
+            spans.push(Span::styled(" │", edge));
+            lines.push(Line::from(spans));
+        }
+        let rule = (inner + 2).saturating_sub(time.width());
+        lines.push(Line::from(vec![
+            Span::raw(indent),
+            Span::styled(format!("╰{}", "─".repeat(rule)), edge),
+            Span::styled(time, theme::faint()),
+            Span::styled("╯", edge),
+        ]));
+        speakers.push(Speaker {
+            first,
+            last: lines.len() - 1,
+            name: name_line(comment, width),
+        });
+    }
+    (lines, speakers)
 }
 
 /// The hunk with a line-number gutter, added / removed lines tinted, and the
@@ -629,6 +783,7 @@ fn draw_code(f: &mut ratatui::Frame<'_>, area: Rect, app: &ThreadsView) {
         Some(line) => format!("{file_name}:{line}"),
         None => file_name.to_string(),
     };
+    app.code_area.set(Some(area));
     let block = ui::panel(&title, focused);
     let inner = block.inner(area);
     let [path_area, code_area] =
@@ -668,13 +823,89 @@ fn draw_code(f: &mut ratatui::Frame<'_>, area: Rect, app: &ThreadsView) {
         .saturating_sub(code_area.height / 3)
         .min(last_page);
     app.code_auto_scroll.set(auto);
-    let scroll = app.code_scroll.unwrap_or(auto);
+    app.code_max_scroll.set(last_page);
+    let scroll = app.code_scroll.unwrap_or(auto).min(last_page);
     f.render_widget(Paragraph::new(lines).scroll((scroll, 0)), code_area);
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn comment(author: &str, body: &str, mine: bool) -> crate::model::Comment {
+        crate::model::Comment {
+            author: author.into(),
+            author_is_bot: false,
+            body: body.into(),
+            diff_hunk: None,
+            created_at: None,
+            url: None,
+            viewer_did_author: mine,
+        }
+    }
+
+    #[test]
+    fn the_wheel_scrolls_the_pane_under_the_pointer() {
+        let mut v = ThreadsView::new(Vec::new(), Vec::new(), Vec::new());
+        v.thread_area.set(Some(Rect::new(0, 10, 40, 20)));
+        v.code_area.set(Some(Rect::new(40, 10, 40, 20)));
+        v.code_auto_scroll.set(5);
+        v.wheel(true, Position::new(50, 15));
+        assert_eq!((v.thread_scroll, v.code_scroll), (0, Some(8)));
+        v.wheel(true, Position::new(5, 15));
+        assert_eq!((v.thread_scroll, v.code_scroll), (3, Some(8)));
+        v.code_max_scroll.set(9);
+        v.wheel(true, Position::new(50, 15));
+        assert_eq!(v.code_scroll, Some(9), "not past the end");
+    }
+
+    #[test]
+    fn the_conversation_puts_others_left_and_mine_right_in_bubbles() {
+        let thread = Thread {
+            pr: 0,
+            is_resolved: false,
+            is_outdated: false,
+            path: None,
+            line: None,
+            original_line: None,
+            comments: vec![
+                comment("alice", "Cap it?", false),
+                comment("alice", "Three is plenty.", false),
+                comment("me", "Done.", true),
+            ],
+        };
+        let (lines, speakers) = conversation(&thread, 40);
+        let rows: Vec<String> = lines.iter().map(|l| l.to_string()).collect();
+        assert_eq!(
+            rows,
+            [
+                "alice",
+                "╭─────────╮",
+                "│ Cap it? │",
+                "╰─────────╯",
+                "╭──────────────────╮",
+                "│ Three is plenty. │",
+                "╰──────────────────╯",
+                "",
+                "                                     you",
+                "                               ╭───────╮",
+                "                               │ Done. │",
+                "                               ╰───────╯",
+            ]
+        );
+        let spans: Vec<(usize, usize, String)> = speakers
+            .iter()
+            .map(|s| (s.first, s.last, s.name.to_string().trim().to_string()))
+            .collect();
+        assert_eq!(
+            spans,
+            [
+                (1, 3, "alice".into()),
+                (4, 6, "alice".into()),
+                (9, 11, "you".into())
+            ]
+        );
+    }
 
     #[test]
     fn hunk_header_gives_old_and_new_starts() {

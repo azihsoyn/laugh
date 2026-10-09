@@ -5,6 +5,11 @@
 //! Without help it goes by what files are (a schema before the code, the
 //! code before its test). With prognost's plan of the change it also goes by
 //! who calls whom: a changed function's file before the files that call it.
+//!
+//! That is bottom-up. Top-down turns it around — the code before its schema
+//! and types, a caller before what it calls — for reading from the entry
+//! points in. Tests still follow their code, and config, docs and generated
+//! files still come last.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::Path;
@@ -105,16 +110,26 @@ fn stem(path: &str) -> String {
     format!("{dir}{base}")
 }
 
+/// Where a kind ranks: contracts and code swap places top-down.
+fn rank(k: Kind, top_down: bool) -> Kind {
+    match (k, top_down) {
+        (Kind::Contract, true) => Kind::Source,
+        (Kind::Source, true) => Kind::Contract,
+        _ => k,
+    }
+}
+
 /// Ranking key: kind first, but a test whose code is in the PR sorts right
 /// after that code.
-fn heuristic_key(file: &PrFile, sources: &BTreeSet<String>) -> (Kind, String, u8) {
+fn heuristic_key(file: &PrFile, sources: &BTreeSet<String>, top_down: bool) -> (Kind, String, u8) {
     let k = kind(file);
     let s = stem(&file.path);
-    match k {
+    let (k, s, t) = match k {
         Kind::Test if sources.contains(&s) => (Kind::Source, s, 1),
         Kind::Source => (Kind::Source, s, 0),
         _ => (k, file.path.clone(), 0),
-    }
+    };
+    (rank(k, top_down), s, t)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -124,14 +139,20 @@ pub struct Step {
 }
 
 /// Orders `indices` (files of one PR): heuristics only when `deps` is empty;
-/// otherwise every `(callee_file, caller_file)` edge puts the callee first.
-pub fn order(files: &[PrFile], indices: &[usize], deps: &[(usize, usize)]) -> Vec<Step> {
+/// otherwise every `(callee_file, caller_file)` edge puts the callee first —
+/// or, `top_down`, the caller.
+pub fn order(
+    files: &[PrFile],
+    indices: &[usize],
+    deps: &[(usize, usize)],
+    top_down: bool,
+) -> Vec<Step> {
     let sources: BTreeSet<String> = indices
         .iter()
         .filter(|&&i| kind(&files[i]) == Kind::Source)
         .map(|&i| stem(&files[i].path))
         .collect();
-    let key = |i: usize| heuristic_key(&files[i], &sources);
+    let key = |i: usize| heuristic_key(&files[i], &sources, top_down);
 
     let mut incoming: HashMap<usize, usize> = indices.iter().map(|&i| (i, 0)).collect();
     let mut outgoing: HashMap<usize, Vec<usize>> = HashMap::new();
@@ -141,8 +162,13 @@ pub fn order(files: &[PrFile], indices: &[usize], deps: &[(usize, usize)]) -> Ve
         if callee == caller || !incoming.contains_key(&callee) || !incoming.contains_key(&caller) {
             continue;
         }
-        outgoing.entry(callee).or_default().push(caller);
-        *incoming.get_mut(&caller).expect("present") += 1;
+        let (first, then) = if top_down {
+            (caller, callee)
+        } else {
+            (callee, caller)
+        };
+        outgoing.entry(first).or_default().push(then);
+        *incoming.get_mut(&then).expect("present") += 1;
         uses.entry(caller).or_default().push(callee);
         used_by.entry(callee).or_default().push(caller);
     }
@@ -284,6 +310,7 @@ fn usable_checkout(dir: &Path, owner: &str, repo: &str, commits: &[&str]) -> boo
 /// Runs `prognost plan` between the PR's base and head in the current
 /// directory, if prognost is installed and the directory is a checkout of
 /// the PR's repository with both commits — otherwise `Ok(None)`.
+#[tracing::instrument(skip_all, fields(repo = %format!("{owner}/{repo}")), err)]
 pub fn prognost_deps(
     files: &[PrFile],
     indices: &[usize],
@@ -351,7 +378,7 @@ mod tests {
         ]);
         fs[6].generated = Some("lockfile");
         let all: Vec<usize> = (0..fs.len()).collect();
-        let steps = order(&fs, &all, &[]);
+        let steps = order(&fs, &all, &[], false);
         assert_eq!(
             paths(&fs, &steps),
             [
@@ -373,7 +400,7 @@ mod tests {
         let fs = files(&["src/client.ts", "src/pool.ts", "src/route.ts"]);
         let all = [0, 1, 2];
         let deps = [(1, 0), (0, 2)]; // pool ← client ← route
-        let steps = order(&fs, &all, &deps);
+        let steps = order(&fs, &all, &deps, false);
         assert_eq!(
             paths(&fs, &steps),
             ["src/pool.ts", "src/client.ts", "src/route.ts"]
@@ -383,9 +410,38 @@ mod tests {
     }
 
     #[test]
+    fn top_down_puts_callers_first_and_code_before_its_types() {
+        let fs = files(&["src/client.ts", "src/pool.ts", "src/route.ts"]);
+        let deps = [(1, 0), (0, 2)]; // pool ← client ← route
+        let steps = order(&fs, &[0, 1, 2], &deps, true);
+        assert_eq!(
+            paths(&fs, &steps),
+            ["src/route.ts", "src/client.ts", "src/pool.ts"]
+        );
+        assert_eq!(steps[1].reason, "uses pool.ts");
+
+        let fs = files(&[
+            "README.md",
+            "src/__tests__/retry.test.ts",
+            "src/retry.ts",
+            "src/types.ts",
+        ]);
+        let steps = order(&fs, &[0, 1, 2, 3], &[], true);
+        assert_eq!(
+            paths(&fs, &steps),
+            [
+                "src/retry.ts",
+                "src/__tests__/retry.test.ts",
+                "src/types.ts",
+                "README.md",
+            ]
+        );
+    }
+
+    #[test]
     fn a_cycle_still_lists_every_file_once() {
         let fs = files(&["a.ts", "b.ts"]);
-        let steps = order(&fs, &[0, 1], &[(0, 1), (1, 0)]);
+        let steps = order(&fs, &[0, 1], &[(0, 1), (1, 0)], false);
         let mut seen: Vec<usize> = steps.iter().map(|s| s.file).collect();
         seen.sort();
         assert_eq!(seen, [0, 1]);

@@ -256,6 +256,7 @@ mod tests {
                     diff_hunk: Some("@@ -40,2 +40,3 @@\n fn retry() {\n+    loop {".into()),
                     created_at: None,
                     url: Some("https://github.com/acme/app/pull/12#discussion_r1".into()),
+                    viewer_did_author: false,
                 },
                 Comment {
                     author: "coderabbitai".into(),
@@ -264,6 +265,7 @@ mod tests {
                     diff_hunk: None,
                     created_at: None,
                     url: None,
+                    viewer_did_author: false,
                 },
             ],
         }

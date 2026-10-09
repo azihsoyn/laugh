@@ -356,12 +356,18 @@ pub struct FilesView {
     /// Reading order per opened PR, and how each was worked out.
     order: Vec<Vec<Step>>,
     order_by: Vec<OrderBy>,
+    /// prognost's `(callee, caller)` file pairs per PR, kept to reorder.
+    deps: Vec<Vec<(usize, usize)>>,
+    /// Callers before callees, code before its types: `O`.
+    top_down: bool,
     prognost: Option<Receiver<PrognostResult>>,
     diff: DiffPane,
     /// `LAUGH_OPEN_CMD`: when set, ⏎ on a file runs it instead of showing
     /// the diff here.
     open_cmd: Option<String>,
     open_request: Option<OpenRequest>,
+    /// Where the tree's rows were last drawn, for mouse clicks.
+    tree_area: Option<Rect>,
 }
 
 impl FilesView {
@@ -536,7 +542,9 @@ impl FilesView {
                 // prognost ran but found no calls between the changed files
                 // (or none it can read — it's TypeScript only): still by kind.
                 Ok(Some(deps)) if !deps.is_empty() => {
-                    self.order[pr] = reading_order::order(&self.files, &indices, &deps);
+                    self.order[pr] =
+                        reading_order::order(&self.files, &indices, &deps, self.top_down);
+                    self.deps[pr] = deps;
                     self.order_by[pr] = OrderBy::Prognost;
                 }
                 Ok(_) => self.order_by[pr] = OrderBy::Kind,
@@ -548,19 +556,49 @@ impl FilesView {
         }
     }
 
-    fn order_label(&self) -> &'static str {
+    /// Flips the reading order between bottom-up and top-down, keeping the
+    /// cursor on the same file.
+    fn flip_order(&mut self) {
+        let selected = self.selected_file();
+        self.top_down = !self.top_down;
+        for (pr, indices) in files_per_pr(&self.dirs, &self.pr_roots)
+            .into_iter()
+            .enumerate()
+        {
+            self.order[pr] =
+                reading_order::order(&self.files, &indices, &self.deps[pr], self.top_down);
+        }
+        if let Some(file) = selected {
+            let at = self
+                .rows()
+                .iter()
+                .position(|r| matches!(r, RowRef::File { file: f, .. } if *f == file));
+            self.table.select(at);
+        }
+        self.clamp();
+    }
+
+    fn order_label(&self) -> String {
         let by: Vec<OrderBy> = self
             .scoped_prs()
             .iter()
             .map(|&pr| self.order_by[pr])
             .collect();
-        if by.contains(&OrderBy::Asking) {
+        let calls = by.contains(&OrderBy::Prognost);
+        let how = if by.contains(&OrderBy::Asking) {
             "by kind · asking prognost…"
-        } else if by.contains(&OrderBy::Prognost) {
+        } else if calls {
             "by calls (prognost)"
         } else {
             "by kind"
-        }
+        };
+        let direction = match (self.top_down, calls) {
+            (false, true) => "what's used first",
+            (true, true) => "callers first",
+            (false, false) => "types first",
+            (true, false) => "code first",
+        };
+        format!("{how} · {direction}")
     }
 
     fn push_contents(&self, dir: usize, rows: &mut Vec<RowRef>) {
@@ -788,9 +826,11 @@ impl FilesView {
         let (dirs, pr_roots) = build_tree(&files, pr_labels);
         let order: Vec<Vec<Step>> = files_per_pr(&dirs, &pr_roots)
             .iter()
-            .map(|indices| reading_order::order(&files, indices, &[]))
+            .map(|indices| reading_order::order(&files, indices, &[], false))
             .collect();
         let mut view = FilesView {
+            deps: vec![Vec::new(); order.len()],
+            top_down: false,
             file_dir: file_dirs(&dirs, files.len()),
             order_by: vec![OrderBy::Kind; order.len()],
             order,
@@ -801,6 +841,7 @@ impl FilesView {
                 .ok()
                 .filter(|c| !c.trim().is_empty()),
             open_request: None,
+            tree_area: None,
             sources,
             dirs,
             pr_roots,
@@ -891,6 +932,17 @@ impl FilesView {
             };
         } else {
             self.handle_key(if down { KeyCode::Down } else { KeyCode::Up });
+        }
+    }
+
+    /// A left click: on a row of the tree, puts the cursor there.
+    pub fn click(&mut self, at: Position) {
+        let Some(area) = self.tree_area.filter(|a| a.contains(at)) else {
+            return;
+        };
+        let row = self.table.offset() + (at.y - area.y) as usize;
+        if row < self.rows().len() {
+            self.table.select(Some(row));
         }
     }
 
@@ -1009,6 +1061,10 @@ impl FilesView {
         }
         if code == KeyCode::Char('o') {
             self.toggle_order();
+            return;
+        }
+        if code == KeyCode::Char('O') && self.order_mode {
+            self.flip_order();
             return;
         }
         if self.diff.open {
@@ -1143,6 +1199,9 @@ impl FilesView {
         };
         if !self.unviewed_generated().is_empty() {
             hints.push(("m", "viewed: generated"));
+        }
+        if self.order_mode {
+            hints.push(("O", "reverse"));
         }
         hints.push(if self.order_mode {
             ("o", "tree")
@@ -1496,6 +1555,7 @@ fn draw(f: &mut ratatui::Frame<'_>, area: Rect, app: &mut FilesView) {
         (list_area, None)
     };
     f.render_stateful_widget(table, list_area, &mut app.table);
+    app.tree_area = Some(list_area.inner(ratatui::layout::Margin::new(1, 1)));
     app.diff.area = diff_area;
     if let Some(diff_area) = diff_area {
         draw_diff(f, diff_area, app);
@@ -1613,10 +1673,13 @@ mod tests {
             order_mode: false,
             order: Vec::new(),
             order_by: Vec::new(),
+            deps: Vec::new(),
+            top_down: false,
             prognost: None,
             diff: DiffPane::default(),
             open_cmd: None,
             open_request: None,
+            tree_area: None,
         }
     }
 
@@ -1720,10 +1783,13 @@ mod tests {
             order_mode: false,
             order: Vec::new(),
             order_by: Vec::new(),
+            deps: Vec::new(),
+            top_down: false,
             prognost: None,
             diff: DiffPane::default(),
             open_cmd: None,
             open_request: None,
+            tree_area: None,
         }
     }
 
@@ -1816,8 +1882,9 @@ mod tests {
             false,
         );
         a.file_dir = file_dirs(&a.dirs, a.files.len());
-        a.order = vec![reading_order::order(&a.files, &[0, 1, 2, 3], &[])];
+        a.order = vec![reading_order::order(&a.files, &[0, 1, 2, 3], &[], false)];
         a.order_by = vec![OrderBy::Kind];
+        a.deps = vec![Vec::new()];
         a.handle_key(KeyCode::Char('o'));
         assert!(a.order_mode);
         assert_eq!(
@@ -1826,6 +1893,14 @@ mod tests {
         );
         a.handle_key(KeyCode::Char('v')); // first row: the schema
         assert_eq!(a.files[3].viewed, ViewedState::Viewed);
+        a.handle_key(KeyCode::Char('j'));
+        a.handle_key(KeyCode::Char('O'));
+        assert_eq!(
+            row_labels(&a),
+            ["retry.ts", "retry.test.ts", "schema.sql", "README.md"]
+        );
+        assert_eq!(a.selected_file(), Some(2), "the cursor stays on retry.ts");
+        assert_eq!(a.order_label(), "by kind · code first");
         a.handle_key(KeyCode::Char('o'));
         assert!(!a.order_mode);
     }
@@ -1983,5 +2058,19 @@ mod tests {
         a.filter.clear();
         a.handle_key(KeyCode::Char('V'));
         assert_eq!(viewed(&a), [true, true, true]);
+    }
+
+    #[test]
+    fn a_click_on_a_row_puts_the_cursor_there() {
+        let mut a = app(files(&["a/x.ts", "a/y.ts", "b.md"]), false);
+        a.clamp();
+        a.tree_area = Some(Rect::new(1, 5, 50, 10));
+        *a.table.offset_mut() = 1;
+        a.click(Position::new(10, 6)); // second visible row = row 2
+        assert_eq!(a.selected_file(), Some(0));
+        a.click(Position::new(10, 14)); // below the last row
+        assert_eq!(a.selected_file(), Some(0));
+        a.click(Position::new(60, 5)); // outside the tree
+        assert_eq!(a.selected_file(), Some(0));
     }
 }

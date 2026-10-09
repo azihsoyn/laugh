@@ -9,6 +9,7 @@ mod logo;
 mod model;
 mod pr_app;
 mod reading_order;
+mod telemetry;
 mod term;
 mod theme;
 mod threads_view;
@@ -200,16 +201,24 @@ fn fetch_files_classified(r: &PrRef) -> Result<github::PullRequestFiles> {
     Ok(data)
 }
 
+#[tracing::instrument(skip_all, fields(prs = refs.len()), err)]
 fn fetch_all(refs: &[PrRef]) -> Result<Vec<Fetched>> {
     // Every PR's files and threads are independent calls; run them all at once.
+    let parent = tracing::Span::current();
     let results: Vec<_> = thread::scope(|s| {
         let handles: Vec<_> = refs
             .iter()
             .map(|r| {
+                // Each thread's spans belong under this one.
+                let (p1, p2, p3) = (parent.clone(), parent.clone(), parent.clone());
                 (
-                    s.spawn(|| fetch_files_classified(r)),
-                    s.spawn(|| github::fetch_threads(&r.owner, &r.repo, r.number)),
-                    s.spawn(|| github::fetch_checks(&r.owner, &r.repo, r.number)),
+                    s.spawn(move || p1.in_scope(|| fetch_files_classified(r))),
+                    s.spawn(move || {
+                        p2.in_scope(|| github::fetch_threads(&r.owner, &r.repo, r.number))
+                    }),
+                    s.spawn(move || {
+                        p3.in_scope(|| github::fetch_checks(&r.owner, &r.repo, r.number))
+                    }),
                 )
             })
             .collect();
@@ -357,6 +366,7 @@ fn with_default_subcommand(mut args: Vec<OsString>) -> Vec<OsString> {
 }
 
 fn main() -> Result<()> {
+    let _telemetry = telemetry::init();
     let matches = Cli::command()
         .before_help(logo::colored())
         .get_matches_from(with_default_subcommand(std::env::args_os().collect()));
