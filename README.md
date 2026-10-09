@@ -177,7 +177,8 @@ and open on the first person rather than on the bots.
 The thread you're on is shown in full on the left, as a chat:
 
 - each comment in its own bubble — other people's on the left, yours on
-  the right — with who wrote it and how long ago
+  the right — with who wrote it and how long ago; scrolled into a long
+  one, its author stays pinned at the top
 - bold, `code`, code blocks and suggested diffs rendered
 
 On the right is the code it was written against: the diff hunk with line
@@ -257,8 +258,8 @@ link.
 | `J` `K` | scroll the failing step's log |
 
 The mouse works too: click a screen tab, a PR in the switcher or a row of
-the files tree, and scroll with the wheel (over the diff, it scrolls the
-diff). While laugh has the mouse, most terminals need Shift (or
+the files tree, and scroll with the wheel — it scrolls whatever is under
+the pointer: the diff beside the files, or a thread or its code. While laugh has the mouse, most terminals need Shift (or
 Option) held to select text.
 
 ## `--json`
