@@ -95,6 +95,25 @@ impl ChecksView {
         self.table.select(sel);
     }
 
+    /// After a refresh, sets this (freshly fetched) view up the way `old`
+    /// was: scope and the check you were on, found again by name.
+    pub fn carry_over(&mut self, old: &ChecksView) {
+        self.scope = old.scope;
+        let old_visible = old.visible();
+        let was = old
+            .table
+            .selected()
+            .and_then(|i| old_visible.get(i))
+            .map(|&i| (old.checks[i].pr, old.checks[i].name.clone()));
+        let at = was.and_then(|(pr, name)| {
+            self.visible()
+                .iter()
+                .position(|&i| self.checks[i].pr == pr && self.checks[i].name == name)
+        });
+        self.table.select(at.or(old.table.selected()));
+        self.clamp();
+    }
+
     pub fn set_scope(&mut self, scope: Option<usize>) {
         self.scope = scope;
         self.table.select(Some(0));

@@ -229,8 +229,16 @@ mod tests {
         let port = listener.local_addr().unwrap().port();
         let server = thread::spawn(move || {
             let (mut conn, _) = listener.accept().unwrap();
-            let mut buf = [0u8; 4096];
-            let n = conn.read(&mut buf).unwrap();
+            // Read the whole request before answering: closing with some
+            // of it unread resets the connection under the client.
+            let mut buf = Vec::new();
+            let mut chunk = [0u8; 4096];
+            while !buf.ends_with(b"spans") {
+                let n = conn.read(&mut chunk).unwrap();
+                assert!(n > 0, "the client hung up early");
+                buf.extend_from_slice(&chunk[..n]);
+            }
+            let n = buf.len();
             conn.write_all(b"HTTP/1.1 202 Accepted\r\nContent-Length: 0\r\n\r\n")
                 .unwrap();
             String::from_utf8_lossy(&buf[..n]).to_string()

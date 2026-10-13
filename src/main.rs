@@ -295,14 +295,36 @@ fn run_pr(args: PrArgs) -> Result<()> {
         return Ok(());
     }
 
-    let labels = short_labels(&refs);
+    let refs_for_reload = refs.clone();
+    let refs_for_watch: Vec<(String, String, u64)> = refs
+        .iter()
+        .map(|r| (r.owner.clone(), r.repo.clone(), r.number))
+        .collect();
+    pr_app::run(
+        assemble(&refs, fetched),
+        Box::new(move || fetch_all(&refs_for_reload).map(|f| assemble(&refs_for_reload, f))),
+        Box::new(move || {
+            refs_for_watch
+                .iter()
+                .map(|(owner, repo, number)| github::fetch_head(owner, repo, *number))
+                .collect()
+        }),
+    )
+}
+
+/// Builds the screens from what was fetched — at start, and again on a
+/// refresh.
+fn assemble(refs: &[PrRef], fetched: Vec<Fetched>) -> pr_app::Loaded {
+    let labels = short_labels(refs);
     let mut headers = Vec::new();
     let mut pr_ids = Vec::new();
     let mut sources = Vec::new();
     let mut files = Vec::new();
     let mut threads = Vec::new();
     let mut checks = Vec::new();
-    for (i, (f, r)) in fetched.into_iter().zip(&refs).enumerate() {
+    let mut heads = Vec::new();
+    for (i, (f, r)) in fetched.into_iter().zip(refs).enumerate() {
+        heads.push(f.files.head_oid.clone());
         checks.extend(f.checks.into_iter().map(|mut c| {
             c.pr = i;
             c
@@ -331,22 +353,23 @@ fn run_pr(args: PrArgs) -> Result<()> {
         });
     }
 
-    pr_app::run(
+    pr_app::Loaded {
         headers,
-        files_view::FilesView::new(pr_ids, &labels, sources, files),
-        threads_view::ThreadsView::new(
+        heads,
+        files: files_view::FilesView::new(pr_ids, &labels, sources, files),
+        threads: threads_view::ThreadsView::new(
             threads,
             labels.clone(),
             refs.iter().map(PrRef::full).collect(),
         ),
-        checks_view::ChecksView::new(
+        checks: checks_view::ChecksView::new(
             checks,
             refs.iter()
                 .map(|r| (r.owner.clone(), r.repo.clone()))
                 .collect(),
             labels,
         ),
-    )
+    }
 }
 
 /// Inserts the default `pr` subcommand unless the first argument already
