@@ -2,7 +2,8 @@
 //! `assets/make_logo.py` colours the SVG: a review comment smiling with
 //! Viewed ticks for eyes, beside a diff that turns a frown into a laugh.
 
-use ratatui::style::Color;
+use ratatui::style::{Color, Modifier, Style};
+use ratatui::text::{Line, Span};
 
 use crate::theme;
 
@@ -100,6 +101,47 @@ pub fn colored() -> String {
     out
 }
 
+/// The logo as styled lines, for the loading screen. With `blink`, the
+/// Viewed-tick eyes are shut.
+pub fn lines(blink: bool) -> Vec<Line<'static>> {
+    let rows: Vec<&str> = LOGO.trim_end().lines().collect();
+    let last_row = rows.len() - 1;
+    rows.iter()
+        .enumerate()
+        .map(|(row, line)| {
+            let band = match row {
+                DEL_ROW => Some(theme::REMOVED_BG),
+                ADD_ROW => Some(theme::ADDED_BG),
+                _ => None,
+            };
+            let chars: Vec<char> = line.chars().collect();
+            let width = if band.is_some() {
+                chars.len().max(DIFF + BAND)
+            } else {
+                chars.len()
+            };
+            let spans: Vec<Span<'static>> = (0..width)
+                .map(|col| {
+                    let ch = chars.get(col).copied().unwrap_or(' ');
+                    let mut style = Style::default();
+                    if let Some(bg) = band.filter(|_| (DIFF..DIFF + BAND).contains(&col)) {
+                        style = style.bg(bg).fg(theme::TEXT);
+                    }
+                    if let Some(p) = paint(row, col, ch, last_row) {
+                        style = style.fg(p.fg);
+                        if p.bold {
+                            style = style.add_modifier(Modifier::BOLD);
+                        }
+                    }
+                    let ch = if blink && ch == '✓' { '─' } else { ch };
+                    Span::styled(ch.to_string(), style)
+                })
+                .collect();
+            Line::from(spans)
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -120,6 +162,19 @@ mod tests {
             .collect();
         let logo: Vec<&str> = LOGO.trim_end().lines().map(str::trim_end).collect();
         assert_eq!(stripped, logo);
+    }
+
+    #[test]
+    fn the_drawn_logo_matches_the_text_and_blinks_its_eyes() {
+        let text = |blink| -> Vec<String> {
+            lines(blink)
+                .iter()
+                .map(|l| l.to_string().trim_end().to_string())
+                .collect()
+        };
+        let logo: Vec<&str> = LOGO.trim_end().lines().map(str::trim_end).collect();
+        assert_eq!(text(false), logo);
+        assert_eq!(text(true)[1], "│  ─   ─  │    12 - frown");
     }
 
     #[test]

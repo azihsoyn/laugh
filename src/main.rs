@@ -270,9 +270,8 @@ fn run_pr(args: PrArgs) -> Result<()> {
         }
     }
 
-    let fetched = fetch_all(&refs)?;
-
     if args.json {
+        let fetched = fetch_all(&refs)?;
         let output = Output {
             prs: fetched
                 .iter()
@@ -301,7 +300,7 @@ fn run_pr(args: PrArgs) -> Result<()> {
         .map(|r| (r.owner.clone(), r.repo.clone(), r.number))
         .collect();
     pr_app::run(
-        assemble(&refs, fetched),
+        refs.iter().map(PrRef::full).collect(),
         Box::new(move || fetch_all(&refs_for_reload).map(|f| assemble(&refs_for_reload, f))),
         Box::new(move || {
             refs_for_watch

@@ -643,8 +643,9 @@ impl FilesView {
             .map(|&pr| self.order_by[pr])
             .collect();
         let calls = by.contains(&OrderBy::Prognost);
+        let asking = format!("by kind · {} asking prognost…", ui::spinner());
         let how = if by.contains(&OrderBy::Asking) {
-            "by kind · asking prognost…"
+            asking.as_str()
         } else if calls {
             "by calls (prognost)"
         } else {
@@ -1403,7 +1404,7 @@ fn draw_diff(f: &mut ratatui::Frame<'_>, area: Rect, app: &mut FilesView) {
         |text: String| Paragraph::new(Span::styled(text, theme::muted())).block(block.clone());
     match app.diff.patches.get(&pf.pr) {
         None | Some(Patches::Loading) => {
-            f.render_widget(note("fetching the diff…".to_string()), area);
+            f.render_widget(note(format!("{} fetching the diff…", ui::spinner())), area);
         }
         Some(Patches::Failed(e)) => f.render_widget(note(e.clone()), area),
         Some(Patches::Loaded(map)) => match map.get(&pf.path).and_then(|p| p.as_deref()) {

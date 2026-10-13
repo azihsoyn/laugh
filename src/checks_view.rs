@@ -331,7 +331,7 @@ impl ChecksView {
                     theme::muted(),
                 ))),
                 (Some(_), None | Some(LogState::Loading)) => lines.push(Line::from(Span::styled(
-                    "fetching the log…",
+                    format!("{} fetching the log…", ui::spinner()),
                     theme::muted(),
                 ))),
                 (Some(_), Some(LogState::Failed(e))) => lines.push(Line::from(Span::styled(

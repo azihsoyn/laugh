@@ -1,7 +1,8 @@
 use std::process::Command;
+use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, MouseButton, MouseEventKind};
@@ -14,7 +15,7 @@ use crate::checks_view::ChecksView;
 use crate::files_view::{FilesView, OpenRequest};
 use crate::term::{self, Term, with_terminal};
 use crate::threads_view::ThreadsView;
-use crate::{theme, ui};
+use crate::{logo, theme, ui};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Screen {
@@ -59,6 +60,16 @@ pub type Heads = Box<dyn Fn() -> Result<Vec<String>> + Send>;
 /// How often to look for new commits.
 const WATCH_EVERY: Duration = Duration::from_secs(60);
 
+/// How long a passing note like `refreshed` stays in the footer.
+const NOTE_FOR: Duration = Duration::from_secs(3);
+
+/// A footer message: one that only reports success fades on its own,
+/// a failure stays until the next key.
+struct Note {
+    text: String,
+    until: Option<Instant>,
+}
+
 enum Refresh {
     Idle,
     /// Asked for, but Viewed changes are still being saved: a fetch now
@@ -84,7 +95,7 @@ struct PrApp {
     threads: ThreadsView,
     checks: ChecksView,
     heads: Vec<String>,
-    reload: std::sync::Arc<Reload>,
+    reload: Arc<Reload>,
     refresh: Refresh,
     /// The PRs whose head has moved since they were loaded.
     pushed: Vec<usize>,
@@ -92,7 +103,7 @@ struct PrApp {
     /// Where the refresh button was last drawn.
     refresh_hit: Option<Rect>,
     /// Outcome of the last refresh, for the footer.
-    status: Option<String>,
+    status: Option<Note>,
 }
 
 impl PrApp {
@@ -114,6 +125,14 @@ impl PrApp {
                 .map(|(i, _)| i)
                 .collect();
         }
+        if self
+            .status
+            .as_ref()
+            .and_then(|n| n.until)
+            .is_some_and(|until| Instant::now() >= until)
+        {
+            self.status = None;
+        }
         match &self.refresh {
             Refresh::Idle => {}
             Refresh::Waiting => {
@@ -130,11 +149,17 @@ impl PrApp {
                 Ok(Ok(loaded)) => {
                     self.apply(loaded);
                     self.refresh = Refresh::Idle;
-                    self.status = Some("refreshed".to_string());
+                    self.status = Some(Note {
+                        text: "✓ refreshed".to_string(),
+                        until: Some(Instant::now() + NOTE_FOR),
+                    });
                 }
                 Ok(Err(e)) => {
                     self.refresh = Refresh::Idle;
-                    self.status = Some(format!("couldn't refresh: {e}"));
+                    self.status = Some(Note {
+                        text: format!("couldn't refresh: {e}"),
+                        until: None,
+                    });
                 }
                 Err(mpsc::TryRecvError::Empty) => {}
                 Err(mpsc::TryRecvError::Disconnected) => self.refresh = Refresh::Idle,
@@ -192,7 +217,70 @@ impl PrApp {
     }
 }
 
-pub fn run(loaded: Loaded, reload: Reload, heads: Heads) -> Result<()> {
+/// Opens laugh: a loading screen while `reload` fetches the PRs (named by
+/// `names`), then the PRs.
+pub fn run(names: Vec<String>, reload: Reload, heads: Heads) -> Result<()> {
+    let reload = Arc::new(reload);
+    with_terminal(|terminal| {
+        let Some(loaded) = splash(terminal, &names, &reload)? else {
+            return Ok(());
+        };
+        run_loaded(terminal, loaded, reload, heads)
+    })
+}
+
+/// The logo, blinking, and a spinner until the PRs are in. `None` if you
+/// quit first.
+fn splash(terminal: &mut Term, names: &[String], reload: &Arc<Reload>) -> Result<Option<Loaded>> {
+    let (tx, rx) = mpsc::channel();
+    let reload = reload.clone();
+    // Not joined: quitting here leaves it behind, with nothing to save.
+    thread::spawn(move || {
+        let _ = tx.send(reload());
+    });
+    loop {
+        match rx.try_recv() {
+            Ok(result) => return result.map(Some),
+            Err(mpsc::TryRecvError::Disconnected) => {
+                anyhow::bail!("loading the pull requests stopped")
+            }
+            Err(mpsc::TryRecvError::Empty) => {}
+        }
+        terminal.draw(|f| draw_splash(f, names))?;
+        if event::poll(Duration::from_millis(100))?
+            && let Event::Key(key) = event::read()?
+            && key.kind == KeyEventKind::Press
+            && matches!(key.code, KeyCode::Char('q') | KeyCode::Esc)
+        {
+            return Ok(None);
+        }
+    }
+}
+
+fn draw_splash(f: &mut ratatui::Frame<'_>, names: &[String]) {
+    // Eyes open, then a blink for a fifth of a second every three.
+    let blink = ui::clock().as_millis() % 3000 >= 2800;
+    let mut lines = logo::lines(blink);
+    lines.push(Line::raw(""));
+    let what = match names {
+        [one] => one.clone(),
+        many => format!("{} pull requests", many.len()),
+    };
+    lines.push(Line::from(vec![
+        Span::styled(format!("{} ", ui::spinner()), theme::accent()),
+        Span::styled(format!("loading {what}…"), theme::muted()),
+    ]));
+    let width = lines.iter().map(Line::width).max().unwrap_or(0) as u16;
+    let area = ui::centered(f.area(), width, lines.len() as u16);
+    f.render_widget(Paragraph::new(lines), area);
+}
+
+fn run_loaded(
+    terminal: &mut Term,
+    loaded: Loaded,
+    reload: Arc<Reload>,
+    heads: Heads,
+) -> Result<()> {
     let (watch_tx, watch) = mpsc::channel();
     thread::spawn(move || {
         loop {
@@ -209,21 +297,19 @@ pub fn run(loaded: Loaded, reload: Reload, heads: Heads) -> Result<()> {
     if app.prs.len() == 1 {
         app.set_scope(Some(0));
     }
-    with_terminal(|terminal| {
-        let result = event_loop(terminal, &mut app);
-        if app.files.pending() > 0 {
-            app.screen = Screen::Files;
-            app.help = false;
-            app.files.show_saving();
-            terminal.draw(|f| draw(f, &mut app))?;
-        }
-        let saved = app.files.finish();
-        result.and(saved)
-    })
+    let result = event_loop(terminal, &mut app);
+    if app.files.pending() > 0 {
+        app.screen = Screen::Files;
+        app.help = false;
+        app.files.show_saving();
+        terminal.draw(|f| draw(f, &mut app))?;
+    }
+    let saved = app.files.finish();
+    result.and(saved)
 }
 
 impl PrApp {
-    fn new(loaded: Loaded, reload: Reload, watch: Receiver<Vec<String>>) -> Self {
+    fn new(loaded: Loaded, reload: Arc<Reload>, watch: Receiver<Vec<String>>) -> Self {
         PrApp {
             prs: loaded.headers,
             scope: None,
@@ -235,7 +321,7 @@ impl PrApp {
             threads: loaded.threads,
             checks: loaded.checks,
             heads: loaded.heads,
-            reload: std::sync::Arc::new(reload),
+            reload,
             refresh: Refresh::Idle,
             pushed: Vec::new(),
             watch,
@@ -422,7 +508,10 @@ fn draw_top(f: &mut ratatui::Frame<'_>, area: Rect, app: &mut PrApp) {
     // Right: the refresh button, and whether there's anything to refresh for.
     let mut button = Vec::new();
     if app.refreshing() {
-        button.push(Span::styled(" ⟳ refreshing… ", theme::muted()));
+        button.push(Span::styled(
+            format!(" {} refreshing… ", ui::spinner()),
+            theme::accent(),
+        ));
     } else {
         if !app.pushed.is_empty() {
             let which = if app.prs.len() > 1 {
@@ -583,7 +672,7 @@ fn draw_footer(f: &mut ratatui::Frame<'_>, area: Rect, app: &PrApp) {
         Screen::Threads => app.threads.status(),
         Screen::Checks => None,
     }
-    .or(app.status.as_deref());
+    .or(app.status.as_ref().map(|n| n.text.as_str()));
     let note = match status {
         Some(status) => Some(Span::styled(
             format!("{status} "),
@@ -717,7 +806,7 @@ mod tests {
         let (watch_tx, watch) = mpsc::channel();
         let mut app = PrApp::new(
             loaded("aaa", &["src/a.rs"]),
-            Box::new(|| Ok(loaded("bbb", &["src/a.rs", "src/b.rs"]))),
+            Arc::new(Box::new(|| Ok(loaded("bbb", &["src/a.rs", "src/b.rs"])))),
             watch,
         );
         watch_tx.send(vec!["aaa".into()]).unwrap();
@@ -736,7 +825,13 @@ mod tests {
             std::thread::sleep(Duration::from_millis(5));
         }
         assert!(!app.refreshing());
-        assert_eq!(app.status.as_deref(), Some("refreshed"));
+        assert_eq!(
+            app.status.as_ref().map(|n| n.text.as_str()),
+            Some("✓ refreshed")
+        );
+        app.status.as_mut().unwrap().until = Some(Instant::now());
+        app.tick_refresh();
+        assert!(app.status.is_none(), "the note fades on its own");
         assert!(app.pushed.is_empty());
         assert_eq!(app.heads, ["bbb"]);
         assert_eq!(app.files.viewed_counts(), (0, 2));

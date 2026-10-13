@@ -1,6 +1,7 @@
 //! Small drawing helpers shared by both screens.
 
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::OnceLock;
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use ratatui::layout::{Constraint, Flex, Layout, Rect};
 use ratatui::style::{Modifier, Style};
@@ -10,6 +11,20 @@ use ratatui::widgets::{Block, BorderType, Borders, Padding};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::theme;
+
+const SPINNER: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+
+/// Time since laugh started; drives the animations.
+pub fn clock() -> std::time::Duration {
+    static START: OnceLock<Instant> = OnceLock::new();
+    START.get_or_init(Instant::now).elapsed()
+}
+
+/// A spinner frame for something still loading. The UI redraws every
+/// tenth of a second, so it turns while anything is waiting.
+pub fn spinner() -> char {
+    SPINNER[(clock().as_millis() / 100) as usize % SPINNER.len()]
+}
 
 /// A rounded panel; the border lights up in the accent colour when focused.
 pub fn panel(title: &str, focused: bool) -> Block<'static> {
