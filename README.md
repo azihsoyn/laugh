@@ -115,6 +115,9 @@ If one fails, its files go back to what GitHub last confirmed and the error
 is shown. Quitting waits for anything still queued.
 
 `H` hides what you've viewed, and any directory with nothing left in it.
+laugh remembers it for next time (in `~/Library/Application Support/laugh/`
+on macOS, `$XDG_STATE_HOME/laugh/` on Linux, `%LOCALAPPDATA%\laugh\` on
+Windows; `LAUGH_STATE_FILE` moves it).
 
 `/` filters the tree by path as you type. Each word is a case-insensitive
 pattern, and a path has to match every one:

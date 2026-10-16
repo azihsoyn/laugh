@@ -15,7 +15,7 @@ use crate::checks_view::ChecksView;
 use crate::files_view::{FilesView, OpenRequest};
 use crate::term::{self, Term, with_terminal};
 use crate::threads_view::ThreadsView;
-use crate::{logo, theme, ui};
+use crate::{logo, prefs, theme, ui};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Screen {
@@ -297,7 +297,9 @@ fn run_loaded(
     if app.prs.len() == 1 {
         app.set_scope(Some(0));
     }
-    let result = event_loop(terminal, &mut app);
+    let mut prefs = prefs::load();
+    app.files.set_hide_viewed(prefs.hide_viewed);
+    let result = event_loop(terminal, &mut app, &mut prefs);
     if app.files.pending() > 0 {
         app.screen = Screen::Files;
         app.help = false;
@@ -331,7 +333,7 @@ impl PrApp {
     }
 }
 
-fn event_loop(terminal: &mut Term, app: &mut PrApp) -> Result<()> {
+fn event_loop(terminal: &mut Term, app: &mut PrApp, prefs: &mut prefs::Prefs) -> Result<()> {
     loop {
         app.tick_refresh();
         app.files.tick();
@@ -383,6 +385,10 @@ fn event_loop(terminal: &mut Term, app: &mut PrApp) -> Result<()> {
             code => match app.screen {
                 Screen::Files => {
                     app.files.handle_key(code);
+                    if app.files.hide_viewed() != prefs.hide_viewed {
+                        prefs.hide_viewed = app.files.hide_viewed();
+                        prefs::save(prefs);
+                    }
                     if let Some(request) = app.files.take_open_request() {
                         let status = open_externally(terminal, app, &request)?;
                         app.files.set_status(status);

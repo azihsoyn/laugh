@@ -8,6 +8,7 @@ mod handoff;
 mod logo;
 mod model;
 mod pr_app;
+mod prefs;
 mod reading_order;
 mod telemetry;
 mod term;

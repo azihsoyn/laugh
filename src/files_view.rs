@@ -376,6 +376,15 @@ impl FilesView {
         self.scope.map_or(ROOT, |pr| self.pr_roots[pr])
     }
 
+    pub fn hide_viewed(&self) -> bool {
+        self.hide_viewed
+    }
+
+    pub fn set_hide_viewed(&mut self, hide: bool) {
+        self.hide_viewed = hide;
+        self.clamp();
+    }
+
     pub fn set_scope(&mut self, scope: Option<usize>) {
         self.scope = scope;
         self.table.select(Some(0));
