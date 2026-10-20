@@ -268,7 +268,9 @@ link.
 
 The mouse works too: click a screen tab, a PR in the switcher, the refresh
 button or a row of the files tree, and scroll with the wheel — it scrolls whatever is under
-the pointer: the diff beside the files, or a thread or its code. While laugh has the mouse, most terminals need Shift (or
+the pointer: the diff beside the files, or a thread or its code. Drag the border between two
+side-by-side panes to make one wider; each screen's split is remembered for next time, along
+with `H`. While laugh has the mouse, most terminals need Shift (or
 Option) held to select text.
 
 ## `--json`

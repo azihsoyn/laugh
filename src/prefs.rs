@@ -1,5 +1,5 @@
-//! Settings that last from one run of laugh to the next — for now, whether
-//! viewed files are hidden. Kept in a small JSON file:
+//! Settings that last from one run of laugh to the next: whether viewed
+//! files are hidden, and where each screen's divider was dragged to. Kept in a small JSON file:
 //! `~/Library/Application Support/laugh/` on macOS, `$XDG_STATE_HOME/laugh/`
 //! (`~/.local/state/laugh/`) elsewhere, `%LOCALAPPDATA%\laugh\` on Windows;
 //! `LAUGH_STATE_FILE` puts it elsewhere.
@@ -17,6 +17,10 @@ use serde::{Deserialize, Serialize};
 pub struct Prefs {
     /// `H` on the Files screen.
     pub hide_viewed: bool,
+    /// Each screen's left pane share, in thousandths, once dragged.
+    pub files_split: Option<u16>,
+    pub threads_split: Option<u16>,
+    pub checks_split: Option<u16>,
 }
 
 pub fn path() -> Option<PathBuf> {

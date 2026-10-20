@@ -281,6 +281,8 @@ struct DiffPane {
     file: Option<usize>,
     /// Where the pane was last drawn, for the mouse wheel.
     area: Option<Rect>,
+    /// The tree on the left, the diff on the right.
+    split: ui::Split,
     patches: HashMap<usize, Patches>,
     tx: Sender<PatchResult>,
     rx: Receiver<PatchResult>,
@@ -294,6 +296,7 @@ impl Default for DiffPane {
             scroll: 0,
             file: None,
             area: None,
+            split: ui::Split::new(400),
             patches: HashMap::new(),
             tx,
             rx,
@@ -376,6 +379,11 @@ impl FilesView {
         self.scope.map_or(ROOT, |pr| self.pr_roots[pr])
     }
 
+    /// Between the tree and the diff, while the diff is open.
+    pub fn split(&self) -> &ui::Split {
+        &self.diff.split
+    }
+
     pub fn hide_viewed(&self) -> bool {
         self.hide_viewed
     }
@@ -418,6 +426,7 @@ impl FilesView {
     pub fn carry_over(&mut self, old: &FilesView) {
         self.scope = old.scope;
         self.hide_viewed = old.hide_viewed;
+        self.diff.split.set_share(old.diff.split.share());
         self.filter = old.filter.clone();
         let folded: HashSet<String> = old.collapsed.iter().map(|&d| old.dir_key(d)).collect();
         self.collapsed = (0..self.dirs.len())
@@ -1615,11 +1624,10 @@ fn draw(f: &mut ratatui::Frame<'_>, area: Rect, app: &mut FilesView) {
     .highlight_symbol(Line::from(Span::styled("▌", theme::accent())))
     .highlight_spacing(HighlightSpacing::Always);
     let (list_area, diff_area) = if app.diff.open {
-        let [list, diff] =
-            Layout::horizontal([Constraint::Percentage(40), Constraint::Percentage(60)])
-                .areas(list_area);
+        let [list, diff] = app.diff.split.areas(list_area);
         (list, Some(diff))
     } else {
+        app.diff.split.hide();
         (list_area, None)
     };
     f.render_stateful_widget(table, list_area, &mut app.table);

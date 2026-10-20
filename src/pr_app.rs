@@ -299,6 +299,15 @@ fn run_loaded(
     }
     let mut prefs = prefs::load();
     app.files.set_hide_viewed(prefs.hide_viewed);
+    for (split, share) in [
+        (app.files.split(), prefs.files_split),
+        (app.threads.split(), prefs.threads_split),
+        (app.checks.split(), prefs.checks_split),
+    ] {
+        if let Some(share) = share {
+            split.set_share(share);
+        }
+    }
     let result = event_loop(terminal, &mut app, &mut prefs);
     if app.files.pending() > 0 {
         app.screen = Screen::Files;
@@ -348,7 +357,12 @@ fn event_loop(terminal: &mut Term, app: &mut PrApp, prefs: &mut prefs::Prefs) ->
         let key = match event::read()? {
             Event::Key(key) if key.kind == KeyEventKind::Press => key,
             Event::Mouse(mouse) => {
-                handle_mouse(app, mouse.kind, Position::new(mouse.column, mouse.row));
+                handle_mouse(
+                    app,
+                    prefs,
+                    mouse.kind,
+                    Position::new(mouse.column, mouse.row),
+                );
                 continue;
             }
             _ => continue,
@@ -441,15 +455,27 @@ fn tab_at(hits: &[(Screen, Rect)], at: Position) -> Option<Screen> {
         .map(|(screen, _)| *screen)
 }
 
+/// The open screen's divider between its two panes.
+fn split(app: &PrApp) -> &ui::Split {
+    match app.screen {
+        Screen::Files => app.files.split(),
+        Screen::Threads => app.threads.split(),
+        Screen::Checks => app.checks.split(),
+    }
+}
+
 /// Clicking a screen tab switches to it; the wheel moves like ↑ / ↓ on
 /// whichever screen is open (with mouse capture on, the terminal no longer
-/// turns the wheel into arrow keys by itself).
-fn handle_mouse(app: &mut PrApp, kind: MouseEventKind, at: Position) {
+/// turns the wheel into arrow keys by itself); dragging the border between
+/// two panes resizes them, and the new split is remembered.
+fn handle_mouse(app: &mut PrApp, prefs: &mut prefs::Prefs, kind: MouseEventKind, at: Position) {
     match kind {
         _ if app.files.is_modal() => {}
         MouseEventKind::Down(MouseButton::Left) => {
             if app.help {
                 app.help = false;
+            } else if split(app).press(at) {
+                // A drag starts; the panes follow until the button comes up.
             } else if app.refresh_hit.is_some_and(|r| r.contains(at)) {
                 app.start_refresh();
             } else if let Some(screen) = tab_at(&app.tab_hits, at) {
@@ -460,6 +486,18 @@ fn handle_mouse(app: &mut PrApp, kind: MouseEventKind, at: Position) {
             } else if app.screen == Screen::Files {
                 app.files.click(at);
             }
+        }
+        MouseEventKind::Drag(MouseButton::Left) => {
+            split(app).drag(at);
+        }
+        MouseEventKind::Up(MouseButton::Left) if split(app).release() => {
+            let share = Some(split(app).share());
+            match app.screen {
+                Screen::Files => prefs.files_split = share,
+                Screen::Threads => prefs.threads_split = share,
+                Screen::Checks => prefs.checks_split = share,
+            }
+            prefs::save(prefs);
         }
         MouseEventKind::ScrollDown | MouseEventKind::ScrollUp if !app.help => {
             let code = if kind == MouseEventKind::ScrollDown {
