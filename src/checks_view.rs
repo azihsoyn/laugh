@@ -35,6 +35,8 @@ pub struct ChecksView {
     logs: HashMap<usize, LogState>,
     log_tx: Sender<(usize, Result<String, String>)>,
     log_rx: Receiver<(usize, Result<String, String>)>,
+    /// The list on the left, the selected check on the right.
+    split: ui::Split,
 }
 
 fn icon(state: CheckState) -> Span<'static> {
@@ -67,10 +69,15 @@ impl ChecksView {
             logs: HashMap::new(),
             log_tx,
             log_rx,
+            split: ui::Split::new(400),
         };
         view.table.select(Some(0));
         view.clamp();
         view
+    }
+
+    pub fn split(&self) -> &ui::Split {
+        &self.split
     }
 
     fn visible(&self) -> Vec<usize> {
@@ -93,6 +100,26 @@ impl ChecksView {
             None => Some(0),
         };
         self.table.select(sel);
+    }
+
+    /// After a refresh, sets this (freshly fetched) view up the way `old`
+    /// was: scope and the check you were on, found again by name.
+    pub fn carry_over(&mut self, old: &ChecksView) {
+        self.scope = old.scope;
+        self.split.set_share(old.split.share());
+        let old_visible = old.visible();
+        let was = old
+            .table
+            .selected()
+            .and_then(|i| old_visible.get(i))
+            .map(|&i| (old.checks[i].pr, old.checks[i].name.clone()));
+        let at = was.and_then(|(pr, name)| {
+            self.visible()
+                .iter()
+                .position(|&i| self.checks[i].pr == pr && self.checks[i].name == name)
+        });
+        self.table.select(at.or(old.table.selected()));
+        self.clamp();
     }
 
     pub fn set_scope(&mut self, scope: Option<usize>) {
@@ -184,11 +211,10 @@ impl ChecksView {
                 )),
                 body,
             );
+            self.split.hide();
             return;
         }
-        let [list, detail] =
-            Layout::horizontal([Constraint::Percentage(40), Constraint::Percentage(60)])
-                .areas(body);
+        let [list, detail] = self.split.areas(body);
         self.draw_list(f, list);
         self.draw_detail(f, detail);
     }
@@ -312,7 +338,7 @@ impl ChecksView {
                     theme::muted(),
                 ))),
                 (Some(_), None | Some(LogState::Loading)) => lines.push(Line::from(Span::styled(
-                    "fetching the log…",
+                    format!("{} fetching the log…", ui::spinner()),
                     theme::muted(),
                 ))),
                 (Some(_), Some(LogState::Failed(e))) => lines.push(Line::from(Span::styled(

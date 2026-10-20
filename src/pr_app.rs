@@ -1,5 +1,8 @@
 use std::process::Command;
-use std::time::Duration;
+use std::sync::Arc;
+use std::sync::mpsc::{self, Receiver};
+use std::thread;
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, MouseButton, MouseEventKind};
@@ -12,7 +15,7 @@ use crate::checks_view::ChecksView;
 use crate::files_view::{FilesView, OpenRequest};
 use crate::term::{self, Term, with_terminal};
 use crate::threads_view::ThreadsView;
-use crate::{theme, ui};
+use crate::{logo, prefs, theme, ui};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Screen {
@@ -39,6 +42,42 @@ pub struct PrHeader {
     pub label: String,
 }
 
+/// Everything a set of PRs opens with; built again on a refresh.
+pub struct Loaded {
+    pub headers: Vec<PrHeader>,
+    /// Each PR's head commit as loaded, to notice pushes after.
+    pub heads: Vec<String>,
+    pub files: FilesView,
+    pub threads: ThreadsView,
+    pub checks: ChecksView,
+}
+
+/// Fetches everything again, off the UI thread.
+pub type Reload = Box<dyn Fn() -> Result<Loaded> + Send + Sync>;
+/// Each PR's head commit right now.
+pub type Heads = Box<dyn Fn() -> Result<Vec<String>> + Send>;
+
+/// How often to look for new commits.
+const WATCH_EVERY: Duration = Duration::from_secs(60);
+
+/// How long a passing note like `refreshed` stays in the footer.
+const NOTE_FOR: Duration = Duration::from_secs(3);
+
+/// A footer message: one that only reports success fades on its own,
+/// a failure stays until the next key.
+struct Note {
+    text: String,
+    until: Option<Instant>,
+}
+
+enum Refresh {
+    Idle,
+    /// Asked for, but Viewed changes are still being saved: a fetch now
+    /// could come back without them.
+    Waiting,
+    Loading(Receiver<Result<Loaded, String>>),
+}
+
 /// One TUI for one or more pull requests: the changed files and the review
 /// threads are two screens (1 / 2), and with several PRs open a switcher
 /// shows them all together or one at a time ([ / ]).
@@ -55,9 +94,106 @@ struct PrApp {
     files: FilesView,
     threads: ThreadsView,
     checks: ChecksView,
+    heads: Vec<String>,
+    reload: Arc<Reload>,
+    refresh: Refresh,
+    /// The PRs whose head has moved since they were loaded.
+    pushed: Vec<usize>,
+    watch: Receiver<Vec<String>>,
+    /// Where the refresh button was last drawn.
+    refresh_hit: Option<Rect>,
+    /// Outcome of the last refresh, for the footer.
+    status: Option<Note>,
 }
 
 impl PrApp {
+    fn start_refresh(&mut self) {
+        if matches!(self.refresh, Refresh::Idle) {
+            self.refresh = Refresh::Waiting;
+            self.status = None;
+        }
+    }
+
+    /// Moves a refresh along; call once per frame.
+    fn tick_refresh(&mut self) {
+        for heads in self.watch.try_iter() {
+            self.pushed = heads
+                .iter()
+                .zip(&self.heads)
+                .enumerate()
+                .filter(|(_, (now, loaded))| now != loaded)
+                .map(|(i, _)| i)
+                .collect();
+        }
+        if self
+            .status
+            .as_ref()
+            .and_then(|n| n.until)
+            .is_some_and(|until| Instant::now() >= until)
+        {
+            self.status = None;
+        }
+        match &self.refresh {
+            Refresh::Idle => {}
+            Refresh::Waiting => {
+                if self.files.pending() == 0 {
+                    let (tx, rx) = mpsc::channel();
+                    let reload = self.reload.clone();
+                    thread::spawn(move || {
+                        let _ = tx.send(reload().map_err(|e| format!("{e:#}")));
+                    });
+                    self.refresh = Refresh::Loading(rx);
+                }
+            }
+            Refresh::Loading(rx) => match rx.try_recv() {
+                Ok(Ok(loaded)) => {
+                    self.apply(loaded);
+                    self.refresh = Refresh::Idle;
+                    self.status = Some(Note {
+                        text: "✓ refreshed".to_string(),
+                        until: Some(Instant::now() + NOTE_FOR),
+                    });
+                }
+                Ok(Err(e)) => {
+                    self.refresh = Refresh::Idle;
+                    self.status = Some(Note {
+                        text: format!("couldn't refresh: {e}"),
+                        until: None,
+                    });
+                }
+                Err(mpsc::TryRecvError::Empty) => {}
+                Err(mpsc::TryRecvError::Disconnected) => self.refresh = Refresh::Idle,
+            },
+        }
+    }
+
+    /// Swaps in freshly fetched PRs, keeping where you were on each screen.
+    fn apply(&mut self, loaded: Loaded) {
+        let Loaded {
+            headers,
+            heads,
+            mut files,
+            mut threads,
+            mut checks,
+        } = loaded;
+        files.carry_over(&self.files);
+        threads.carry_over(&self.threads);
+        checks.carry_over(&self.checks);
+        // The old view's saver has nothing left to save (that's what
+        // Waiting was for); let it go.
+        let _ = self.files.finish();
+        self.files = files;
+        self.threads = threads;
+        self.checks = checks;
+        self.prs = headers;
+        self.heads = heads;
+        self.pushed.clear();
+    }
+
+    fn refreshing(&self) -> bool {
+        !matches!(self.refresh, Refresh::Idle)
+    }
+
     fn set_scope(&mut self, scope: Option<usize>) {
         self.scope = scope;
         self.files.set_scope(scope);
@@ -81,41 +217,134 @@ impl PrApp {
     }
 }
 
-pub fn run(
-    prs: Vec<PrHeader>,
-    files: FilesView,
-    threads: ThreadsView,
-    checks: ChecksView,
-) -> Result<()> {
-    let mut app = PrApp {
-        prs,
-        scope: None,
-        screen: Screen::Files,
-        help: false,
-        tab_hits: Vec::new(),
-        pr_hits: Vec::new(),
-        files,
-        threads,
-        checks,
-    };
-    if app.prs.len() == 1 {
-        app.set_scope(Some(0));
-    }
+/// Opens laugh: a loading screen while `reload` fetches the PRs (named by
+/// `names`), then the PRs.
+pub fn run(names: Vec<String>, reload: Reload, heads: Heads) -> Result<()> {
+    let reload = Arc::new(reload);
     with_terminal(|terminal| {
-        let result = event_loop(terminal, &mut app);
-        if app.files.pending() > 0 {
-            app.screen = Screen::Files;
-            app.help = false;
-            app.files.show_saving();
-            terminal.draw(|f| draw(f, &mut app))?;
-        }
-        let saved = app.files.finish();
-        result.and(saved)
+        let Some(loaded) = splash(terminal, &names, &reload)? else {
+            return Ok(());
+        };
+        run_loaded(terminal, loaded, reload, heads)
     })
 }
 
-fn event_loop(terminal: &mut Term, app: &mut PrApp) -> Result<()> {
+/// The logo, blinking, and a spinner until the PRs are in. `None` if you
+/// quit first.
+fn splash(terminal: &mut Term, names: &[String], reload: &Arc<Reload>) -> Result<Option<Loaded>> {
+    let (tx, rx) = mpsc::channel();
+    let reload = reload.clone();
+    // Not joined: quitting here leaves it behind, with nothing to save.
+    thread::spawn(move || {
+        let _ = tx.send(reload());
+    });
     loop {
+        match rx.try_recv() {
+            Ok(result) => return result.map(Some),
+            Err(mpsc::TryRecvError::Disconnected) => {
+                anyhow::bail!("loading the pull requests stopped")
+            }
+            Err(mpsc::TryRecvError::Empty) => {}
+        }
+        terminal.draw(|f| draw_splash(f, names))?;
+        if event::poll(Duration::from_millis(100))?
+            && let Event::Key(key) = event::read()?
+            && key.kind == KeyEventKind::Press
+            && matches!(key.code, KeyCode::Char('q') | KeyCode::Esc)
+        {
+            return Ok(None);
+        }
+    }
+}
+
+fn draw_splash(f: &mut ratatui::Frame<'_>, names: &[String]) {
+    // Eyes open, then a blink for a fifth of a second every three.
+    let blink = ui::clock().as_millis() % 3000 >= 2800;
+    let mut lines = logo::lines(blink);
+    lines.push(Line::raw(""));
+    let what = match names {
+        [one] => one.clone(),
+        many => format!("{} pull requests", many.len()),
+    };
+    lines.push(Line::from(vec![
+        Span::styled(format!("{} ", ui::spinner()), theme::accent()),
+        Span::styled(format!("loading {what}…"), theme::muted()),
+    ]));
+    let width = lines.iter().map(Line::width).max().unwrap_or(0) as u16;
+    let area = ui::centered(f.area(), width, lines.len() as u16);
+    f.render_widget(Paragraph::new(lines), area);
+}
+
+fn run_loaded(
+    terminal: &mut Term,
+    loaded: Loaded,
+    reload: Arc<Reload>,
+    heads: Heads,
+) -> Result<()> {
+    let (watch_tx, watch) = mpsc::channel();
+    thread::spawn(move || {
+        loop {
+            thread::sleep(WATCH_EVERY);
+            // A failed look (offline, rate limit) just waits for the next.
+            if let Ok(now) = heads()
+                && watch_tx.send(now).is_err()
+            {
+                break;
+            }
+        }
+    });
+    let mut app = PrApp::new(loaded, reload, watch);
+    if app.prs.len() == 1 {
+        app.set_scope(Some(0));
+    }
+    let mut prefs = prefs::load();
+    app.files.set_hide_viewed(prefs.hide_viewed);
+    for (split, share) in [
+        (app.files.split(), prefs.files_split),
+        (app.threads.split(), prefs.threads_split),
+        (app.checks.split(), prefs.checks_split),
+    ] {
+        if let Some(share) = share {
+            split.set_share(share);
+        }
+    }
+    let result = event_loop(terminal, &mut app, &mut prefs);
+    if app.files.pending() > 0 {
+        app.screen = Screen::Files;
+        app.help = false;
+        app.files.show_saving();
+        terminal.draw(|f| draw(f, &mut app))?;
+    }
+    let saved = app.files.finish();
+    result.and(saved)
+}
+
+impl PrApp {
+    fn new(loaded: Loaded, reload: Arc<Reload>, watch: Receiver<Vec<String>>) -> Self {
+        PrApp {
+            prs: loaded.headers,
+            scope: None,
+            screen: Screen::Files,
+            help: false,
+            tab_hits: Vec::new(),
+            pr_hits: Vec::new(),
+            files: loaded.files,
+            threads: loaded.threads,
+            checks: loaded.checks,
+            heads: loaded.heads,
+            reload,
+            refresh: Refresh::Idle,
+            pushed: Vec::new(),
+            watch,
+            refresh_hit: None,
+            status: None,
+        }
+    }
+}
+
+fn event_loop(terminal: &mut Term, app: &mut PrApp, prefs: &mut prefs::Prefs) -> Result<()> {
+    loop {
+        app.tick_refresh();
         app.files.tick();
         if app.screen == Screen::Checks {
             app.checks.tick();
@@ -128,11 +357,17 @@ fn event_loop(terminal: &mut Term, app: &mut PrApp) -> Result<()> {
         let key = match event::read()? {
             Event::Key(key) if key.kind == KeyEventKind::Press => key,
             Event::Mouse(mouse) => {
-                handle_mouse(app, mouse.kind, Position::new(mouse.column, mouse.row));
+                handle_mouse(
+                    app,
+                    prefs,
+                    mouse.kind,
+                    Position::new(mouse.column, mouse.row),
+                );
                 continue;
             }
             _ => continue,
         };
+        app.status = None;
         if app.help {
             app.help = false;
             if !matches!(key.code, KeyCode::Char('q')) {
@@ -153,6 +388,7 @@ fn event_loop(terminal: &mut Term, app: &mut PrApp) -> Result<()> {
         match key.code {
             KeyCode::Char('q') | KeyCode::Esc => return Ok(()),
             KeyCode::Char('?') => app.help = true,
+            KeyCode::Char('R') => app.start_refresh(),
             KeyCode::Char('1') => app.screen = Screen::Files,
             KeyCode::Char('2') => app.screen = Screen::Threads,
             KeyCode::Char('3') => app.screen = Screen::Checks,
@@ -163,6 +399,10 @@ fn event_loop(terminal: &mut Term, app: &mut PrApp) -> Result<()> {
             code => match app.screen {
                 Screen::Files => {
                     app.files.handle_key(code);
+                    if app.files.hide_viewed() != prefs.hide_viewed {
+                        prefs.hide_viewed = app.files.hide_viewed();
+                        prefs::save(prefs);
+                    }
                     if let Some(request) = app.files.take_open_request() {
                         let status = open_externally(terminal, app, &request)?;
                         app.files.set_status(status);
@@ -215,15 +455,29 @@ fn tab_at(hits: &[(Screen, Rect)], at: Position) -> Option<Screen> {
         .map(|(screen, _)| *screen)
 }
 
+/// The open screen's divider between its two panes.
+fn split(app: &PrApp) -> &ui::Split {
+    match app.screen {
+        Screen::Files => app.files.split(),
+        Screen::Threads => app.threads.split(),
+        Screen::Checks => app.checks.split(),
+    }
+}
+
 /// Clicking a screen tab switches to it; the wheel moves like ↑ / ↓ on
 /// whichever screen is open (with mouse capture on, the terminal no longer
-/// turns the wheel into arrow keys by itself).
-fn handle_mouse(app: &mut PrApp, kind: MouseEventKind, at: Position) {
+/// turns the wheel into arrow keys by itself); dragging the border between
+/// two panes resizes them, and the new split is remembered.
+fn handle_mouse(app: &mut PrApp, prefs: &mut prefs::Prefs, kind: MouseEventKind, at: Position) {
     match kind {
         _ if app.files.is_modal() => {}
         MouseEventKind::Down(MouseButton::Left) => {
             if app.help {
                 app.help = false;
+            } else if split(app).press(at) {
+                // A drag starts; the panes follow until the button comes up.
+            } else if app.refresh_hit.is_some_and(|r| r.contains(at)) {
+                app.start_refresh();
             } else if let Some(screen) = tab_at(&app.tab_hits, at) {
                 app.screen = screen;
             } else if let Some((scope, _)) = app.pr_hits.iter().find(|(_, r)| r.contains(at)) {
@@ -232,6 +486,18 @@ fn handle_mouse(app: &mut PrApp, kind: MouseEventKind, at: Position) {
             } else if app.screen == Screen::Files {
                 app.files.click(at);
             }
+        }
+        MouseEventKind::Drag(MouseButton::Left) => {
+            split(app).drag(at);
+        }
+        MouseEventKind::Up(MouseButton::Left) if split(app).release() => {
+            let share = Some(split(app).share());
+            match app.screen {
+                Screen::Files => prefs.files_split = share,
+                Screen::Threads => prefs.threads_split = share,
+                Screen::Checks => prefs.checks_split = share,
+            }
+            prefs::save(prefs);
         }
         MouseEventKind::ScrollDown | MouseEventKind::ScrollUp if !app.help => {
             let code = if kind == MouseEventKind::ScrollDown {
@@ -282,7 +548,50 @@ fn draw(f: &mut ratatui::Frame<'_>, app: &mut PrApp) {
     }
 }
 
-fn draw_top(f: &mut ratatui::Frame<'_>, area: Rect, app: &PrApp) {
+fn draw_top(f: &mut ratatui::Frame<'_>, area: Rect, app: &mut PrApp) {
+    // Right: the refresh button, and whether there's anything to refresh for.
+    let mut button = Vec::new();
+    if app.refreshing() {
+        button.push(Span::styled(
+            format!(" {} refreshing… ", ui::spinner()),
+            theme::accent(),
+        ));
+    } else {
+        if !app.pushed.is_empty() {
+            let which = if app.prs.len() > 1 {
+                let labels: Vec<&str> = app
+                    .pushed
+                    .iter()
+                    .map(|&i| app.prs[i].label.as_str())
+                    .collect();
+                format!("new commits on {} ", labels.join(", "))
+            } else {
+                "new commits ".to_string()
+            };
+            button.push(Span::styled(
+                format!("● {which}"),
+                theme::bold(Style::default().fg(theme::YELLOW)),
+            ));
+        }
+        let style = if app.pushed.is_empty() {
+            theme::muted()
+        } else {
+            theme::pill_on()
+        };
+        button.push(Span::styled(" ↻ R refresh ", style));
+    }
+    let width = button.iter().map(|s| s.width() as u16).sum::<u16>() + 1;
+    let [area, right] =
+        Layout::horizontal([Constraint::Min(0), Constraint::Length(width)]).areas(area);
+    let last = button.last().map_or(0, |s| s.width() as u16);
+    app.refresh_hit = Some(Rect::new(
+        right.x + right.width - 1 - last,
+        right.y,
+        last,
+        1,
+    ));
+    f.render_widget(Paragraph::new(Line::from(button)), right);
+
     let mut spans = vec![Span::styled(
         " ◆ laugh ",
         theme::bold(Style::default().fg(theme::BRAND)),
@@ -406,7 +715,8 @@ fn draw_footer(f: &mut ratatui::Frame<'_>, area: Rect, app: &PrApp) {
         Screen::Files => app.files.status(),
         Screen::Threads => app.threads.status(),
         Screen::Checks => None,
-    };
+    }
+    .or(app.status.as_ref().map(|n| n.text.as_str()));
     let note = match status {
         Some(status) => Some(Span::styled(
             format!("{status} "),
@@ -437,6 +747,7 @@ const HELP: &[(&str, &[(&str, &str)])] = &[
             ("1 2 3", "files / threads / checks"),
             ("tab  ⇧tab", "next / previous screen"),
             ("[  ]", "all PRs / one PR at a time"),
+            ("R", "refresh: fetch the PRs again, staying where you are"),
             ("?", "this list"),
             ("q", "quit (waits for pending saves)"),
         ],
@@ -506,6 +817,69 @@ fn draw_help(f: &mut ratatui::Frame<'_>, area: Rect) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::{PrFile, ViewedState};
+
+    fn loaded(head: &str, paths: &[&str]) -> Loaded {
+        let files = paths
+            .iter()
+            .map(|p| PrFile {
+                pr: 0,
+                path: p.to_string(),
+                additions: 1,
+                deletions: 0,
+                viewed: ViewedState::Unviewed,
+                generated: None,
+            })
+            .collect();
+        Loaded {
+            headers: vec![PrHeader {
+                repo: "acme/app".into(),
+                number: 1,
+                title: "t".into(),
+                label: "app#1".into(),
+            }],
+            heads: vec![head.into()],
+            files: FilesView::new(vec!["PR_1".into()], &["app#1".into()], Vec::new(), files),
+            threads: ThreadsView::new(Vec::new(), Vec::new(), Vec::new()),
+            checks: ChecksView::new(Vec::new(), Vec::new(), Vec::new()),
+        }
+    }
+
+    #[test]
+    fn a_push_is_noticed_and_r_brings_in_the_new_commits() {
+        let (watch_tx, watch) = mpsc::channel();
+        let mut app = PrApp::new(
+            loaded("aaa", &["src/a.rs"]),
+            Arc::new(Box::new(|| Ok(loaded("bbb", &["src/a.rs", "src/b.rs"])))),
+            watch,
+        );
+        watch_tx.send(vec!["aaa".into()]).unwrap();
+        app.tick_refresh();
+        assert!(app.pushed.is_empty(), "same head: nothing new");
+        watch_tx.send(vec!["bbb".into()]).unwrap();
+        app.tick_refresh();
+        assert_eq!(app.pushed, [0]);
+
+        app.start_refresh();
+        for _ in 0..200 {
+            app.tick_refresh();
+            if !app.refreshing() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(!app.refreshing());
+        assert_eq!(
+            app.status.as_ref().map(|n| n.text.as_str()),
+            Some("✓ refreshed")
+        );
+        app.status.as_mut().unwrap().until = Some(Instant::now());
+        app.tick_refresh();
+        assert!(app.status.is_none(), "the note fades on its own");
+        assert!(app.pushed.is_empty());
+        assert_eq!(app.heads, ["bbb"]);
+        assert_eq!(app.files.viewed_counts(), (0, 2));
+    }
 
     #[test]
     fn clicks_land_on_the_tab_under_the_pointer() {

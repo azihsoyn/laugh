@@ -151,6 +151,8 @@ pub struct ThreadsView {
     /// Where the panes were last drawn, for the wheel.
     thread_area: Cell<Option<Rect>>,
     code_area: Cell<Option<Rect>>,
+    /// The conversation on the left, the code on the right.
+    split: ui::Split,
 }
 
 impl ThreadsView {
@@ -175,6 +177,7 @@ impl ThreadsView {
             code_max_scroll: Cell::new(u16::MAX),
             thread_area: Cell::new(None),
             code_area: Cell::new(None),
+            split: ui::Split::new(450),
         };
         view.clamp_selection();
         view
@@ -292,6 +295,10 @@ impl ThreadsView {
         }
     }
 
+    pub fn split(&self) -> &ui::Split {
+        &self.split
+    }
+
     /// The wheel scrolls whichever pane is under the pointer, whatever has
     /// the keyboard; elsewhere (the cards) it scrolls the focused one.
     pub fn wheel(&mut self, down: bool, at: Position) {
@@ -321,6 +328,40 @@ impl ThreadsView {
         self.selected = Some(0);
         self.clamp_selection();
         self.reset_scroll();
+    }
+
+    /// After a refresh, sets this (freshly fetched) view up the way `old`
+    /// was: scope, filter, person and the thread you were on, found again
+    /// by its first comment.
+    pub fn carry_over(&mut self, old: &ThreadsView) {
+        self.scope = old.scope;
+        self.split.set_share(old.split.share());
+        self.state_filter = old.state_filter;
+        self.focus = old.focus;
+        let login = old.tabs.get(old.selected_tab).map(|t| t.login.clone());
+        if let Some(i) = self
+            .tabs
+            .iter()
+            .position(|t| Some(t.login.clone()) == login)
+        {
+            self.selected_tab = i;
+        }
+        let url = old
+            .selected_thread()
+            .and_then(|t| t.starter())
+            .and_then(|c| c.url.clone());
+        let visible = self.visible_indices();
+        let at = url.and_then(|url| {
+            visible.iter().position(|&i| {
+                self.threads[i].starter().and_then(|c| c.url.as_deref()) == Some(url.as_str())
+            })
+        });
+        self.selected = at.or(old.selected);
+        self.clamp_selection();
+        if at.is_some() {
+            self.thread_scroll = old.thread_scroll;
+            self.code_scroll = old.code_scroll;
+        }
     }
 
     /// The PR a thread belongs to, when telling PRs apart matters.
@@ -407,9 +448,7 @@ impl ThreadsView {
         draw_people(f, people, self);
         draw_cards(f, cards, self);
 
-        let [thread, code] =
-            Layout::horizontal([Constraint::Percentage(45), Constraint::Percentage(55)])
-                .areas(body);
+        let [thread, code] = self.split.areas(body);
         draw_thread_content(f, thread, self);
         draw_code(f, code, self);
     }

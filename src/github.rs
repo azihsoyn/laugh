@@ -231,6 +231,28 @@ pub fn fetch_threads(owner: &str, repo: &str, pr: u64) -> Result<PullRequestThre
 
 // ---- changed files and Viewed state ----
 
+/// The PR's head commit right now, to tell when commits have been pushed
+/// since it was loaded.
+#[tracing::instrument(level = "debug", skip_all, fields(pr = %format!("{owner}/{repo}#{pr}")), err)]
+pub fn fetch_head(owner: &str, repo: &str, pr: u64) -> Result<String> {
+    #[derive(Deserialize)]
+    struct Head {
+        #[serde(rename = "headRefOid")]
+        head_oid: String,
+    }
+    let data: RepositoryData<Head> = graphql(
+        "query($owner: String!, $repo: String!, $pr: Int!) {
+           repository(owner: $owner, name: $repo) { pullRequest(number: $pr) { headRefOid } }
+         }",
+        &[
+            Var::String("owner", owner),
+            Var::String("repo", repo),
+            Var::Raw("pr", pr.to_string()),
+        ],
+    )?;
+    Ok(pull_request_of(data, owner, repo, pr)?.head_oid)
+}
+
 const FILES_QUERY: &str = r#"
 query($owner: String!, $repo: String!, $pr: Int!, $after: String) {
   repository(owner: $owner, name: $repo) {

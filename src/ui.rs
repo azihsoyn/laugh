@@ -1,8 +1,10 @@
 //! Small drawing helpers shared by both screens.
 
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::cell::Cell;
+use std::sync::OnceLock;
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
-use ratatui::layout::{Constraint, Flex, Layout, Rect};
+use ratatui::layout::{Constraint, Flex, Layout, Position, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Padding};
@@ -10,6 +12,20 @@ use ratatui::widgets::{Block, BorderType, Borders, Padding};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::theme;
+
+const SPINNER: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+
+/// Time since laugh started; drives the animations.
+pub fn clock() -> std::time::Duration {
+    static START: OnceLock<Instant> = OnceLock::new();
+    START.get_or_init(Instant::now).elapsed()
+}
+
+/// A spinner frame for something still loading. The UI redraws every
+/// tenth of a second, so it turns while anything is waiting.
+pub fn spinner() -> char {
+    SPINNER[(clock().as_millis() / 100) as usize % SPINNER.len()]
+}
 
 /// A rounded panel; the border lights up in the accent colour when focused.
 pub fn panel(title: &str, focused: bool) -> Block<'static> {
@@ -61,6 +77,101 @@ pub fn centered(area: Rect, width: u16, height: u16) -> Rect {
         .flex(Flex::Center)
         .areas(row);
     cell
+}
+
+/// Two panes side by side, split by a divider the mouse can drag: press on
+/// the borders where they meet, move, let go.
+pub struct Split {
+    /// The left pane's share of the width, in thousandths.
+    share: Cell<u16>,
+    /// Where it was last drawn.
+    area: Cell<Option<Rect>>,
+    /// While dragging: how far right of the pointer the divider sits.
+    grab: Cell<Option<i32>>,
+}
+
+/// Neither pane is dragged narrower than this.
+const MIN_PANE: u16 = 20;
+
+impl Split {
+    pub fn new(share: u16) -> Self {
+        Split {
+            share: Cell::new(share.clamp(1, 999)),
+            area: Cell::new(None),
+            grab: Cell::new(None),
+        }
+    }
+
+    pub fn share(&self) -> u16 {
+        self.share.get()
+    }
+
+    pub fn set_share(&self, share: u16) {
+        self.share.set(share.clamp(1, 999));
+    }
+
+    fn left_width(&self, width: u16) -> u16 {
+        let w = (u32::from(width) * u32::from(self.share.get()) / 1000) as u16;
+        if width >= 2 * MIN_PANE {
+            w.clamp(MIN_PANE, width - MIN_PANE)
+        } else {
+            w
+        }
+    }
+
+    /// Lays `area` out as the two panes, and remembers it for the mouse.
+    pub fn areas(&self, area: Rect) -> [Rect; 2] {
+        self.area.set(Some(area));
+        let left = self.left_width(area.width);
+        Layout::horizontal([Constraint::Length(left), Constraint::Min(0)]).areas(area)
+    }
+
+    /// Not drawn this frame (the second pane is closed).
+    pub fn hide(&self) {
+        self.area.set(None);
+        self.grab.set(None);
+    }
+
+    /// The column the left pane ends at (exclusive).
+    fn divider(&self, area: Rect) -> u16 {
+        area.x + self.left_width(area.width)
+    }
+
+    /// A press: starts a drag when it lands on the divider — the left
+    /// pane's right border or the right pane's left one.
+    pub fn press(&self, at: Position) -> bool {
+        let Some(area) = self.area.get().filter(|a| a.contains(at)) else {
+            return false;
+        };
+        let divider = self.divider(area);
+        if at.x + 1 == divider || at.x == divider {
+            self.grab.set(Some(i32::from(divider) - i32::from(at.x)));
+            true
+        } else {
+            false
+        }
+    }
+
+    /// The pointer moved with the button held: moves the divider with it.
+    pub fn drag(&self, at: Position) -> bool {
+        let (Some(grab), Some(area)) = (self.grab.get(), self.area.get()) else {
+            return false;
+        };
+        if area.width < 2 * MIN_PANE {
+            return true;
+        }
+        let left = (i32::from(at.x) + grab - i32::from(area.x))
+            .clamp(i32::from(MIN_PANE), i32::from(area.width - MIN_PANE));
+        // Round up so the width comes back exactly from the share.
+        let share = ((left as u32 * 1000).div_ceil(u32::from(area.width))) as u16;
+        self.set_share(share);
+        true
+    }
+
+    /// The button came up: true if a drag just ended.
+    pub fn release(&self) -> bool {
+        self.grab.take().is_some()
+    }
 }
 
 // ---- time ----
@@ -332,6 +443,37 @@ pub fn diff_lines(diff: &str, width: usize) -> (Vec<Line<'static>>, Vec<Option<i
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dragging_the_divider_moves_it_with_the_pointer() {
+        let split = Split::new(400);
+        let [left, right] = split.areas(Rect::new(0, 5, 100, 20));
+        assert_eq!((left.width, right.x), (40, 40));
+        // Away from the divider nothing happens.
+        assert!(!split.press(Position::new(10, 8)));
+        assert!(!split.drag(Position::new(70, 8)));
+        // Grabbing the left pane's border and moving right 20 columns.
+        assert!(split.press(Position::new(39, 8)));
+        assert!(split.drag(Position::new(59, 8)));
+        assert!(split.release());
+        let [left, _] = split.areas(Rect::new(0, 5, 100, 20));
+        assert_eq!(left.width, 60);
+        // Neither side gets narrower than MIN_PANE.
+        assert!(split.press(Position::new(60, 8)));
+        split.drag(Position::new(99, 8));
+        split.release();
+        let [left, right] = split.areas(Rect::new(0, 5, 100, 20));
+        assert_eq!((left.width, right.width), (80, 20));
+        assert!(!split.release());
+    }
+
+    #[test]
+    fn a_hidden_split_takes_no_presses() {
+        let split = Split::new(500);
+        split.areas(Rect::new(0, 0, 100, 10));
+        split.hide();
+        assert!(!split.press(Position::new(50, 3)));
+    }
 
     fn texts(lines: &[Line]) -> Vec<String> {
         lines.iter().map(|l| l.to_string()).collect()

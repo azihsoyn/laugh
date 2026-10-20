@@ -87,6 +87,11 @@ one tree and one list of threads — or one PR at a time.
 The footer always shows the keys that work where the cursor is, and `?`
 lists them all.
 
+`R` (or `↻ R refresh`, top right) fetches the PRs again without leaving
+laugh, and keeps where you were — the filter, folds, the file or thread or
+check under the cursor. laugh looks for new commits every minute and says
+`● new commits` up there when someone has pushed.
+
 ### 1 · Files
 
 The changed files as a tree. A chain of directories with nothing else in
@@ -110,6 +115,9 @@ If one fails, its files go back to what GitHub last confirmed and the error
 is shown. Quitting waits for anything still queued.
 
 `H` hides what you've viewed, and any directory with nothing left in it.
+laugh remembers it for next time (in `~/Library/Application Support/laugh/`
+on macOS, `$XDG_STATE_HOME/laugh/` on Linux, `%LOCALAPPDATA%\laugh\` on
+Windows; `LAUGH_STATE_FILE` moves it).
 
 `/` filters the tree by path as you type. Each word is a case-insensitive
 pattern, and a path has to match every one:
@@ -224,6 +232,7 @@ link.
 | `1` `2` `3` | Files / Threads / Checks |
 | `tab` `shift-tab` | next / previous screen |
 | `[` `]` | All PRs, or one at a time |
+| `R` | refresh: fetch the PRs again, staying where you are |
 | `?` | every key |
 | `q` | quit (after anything still being saved) |
 
@@ -257,9 +266,11 @@ link.
 | `j` `k` | move between checks |
 | `J` `K` | scroll the failing step's log |
 
-The mouse works too: click a screen tab, a PR in the switcher or a row of
-the files tree, and scroll with the wheel — it scrolls whatever is under
-the pointer: the diff beside the files, or a thread or its code. While laugh has the mouse, most terminals need Shift (or
+The mouse works too: click a screen tab, a PR in the switcher, the refresh
+button or a row of the files tree, and scroll with the wheel — it scrolls whatever is under
+the pointer: the diff beside the files, or a thread or its code. Drag the border between two
+side-by-side panes to make one wider; each screen's split is remembered for next time, along
+with `H`. While laugh has the mouse, most terminals need Shift (or
 Option) held to select text.
 
 ## `--json`

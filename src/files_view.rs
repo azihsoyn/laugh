@@ -200,7 +200,7 @@ fn word_regex(word: &str) -> Option<Regex> {
 /// The `/` filter. Each whitespace-separated word is a case-insensitive
 /// glob or regex, and a path has to match all of them; a word that is
 /// neither (yet — say, halfway through typing a group) is matched as text.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 struct Filter {
     text: String,
     words: Vec<Regex>,
@@ -281,6 +281,8 @@ struct DiffPane {
     file: Option<usize>,
     /// Where the pane was last drawn, for the mouse wheel.
     area: Option<Rect>,
+    /// The tree on the left, the diff on the right.
+    split: ui::Split,
     patches: HashMap<usize, Patches>,
     tx: Sender<PatchResult>,
     rx: Receiver<PatchResult>,
@@ -294,6 +296,7 @@ impl Default for DiffPane {
             scroll: 0,
             file: None,
             area: None,
+            split: ui::Split::new(400),
             patches: HashMap::new(),
             tx,
             rx,
@@ -376,10 +379,76 @@ impl FilesView {
         self.scope.map_or(ROOT, |pr| self.pr_roots[pr])
     }
 
+    /// Between the tree and the diff, while the diff is open.
+    pub fn split(&self) -> &ui::Split {
+        &self.diff.split
+    }
+
+    pub fn hide_viewed(&self) -> bool {
+        self.hide_viewed
+    }
+
+    pub fn set_hide_viewed(&mut self, hide: bool) {
+        self.hide_viewed = hide;
+        self.clamp();
+    }
+
     pub fn set_scope(&mut self, scope: Option<usize>) {
         self.scope = scope;
         self.table.select(Some(0));
         self.clamp();
+    }
+
+    /// A directory by its path from the top, labels and all, so the same
+    /// directory can be found in a tree built again.
+    fn dir_key(&self, mut dir: usize) -> String {
+        let mut parts = vec![self.dirs[dir].label.as_str()];
+        while let Some(parent) = self.dirs[dir].parent {
+            parts.push(self.dirs[parent].label.as_str());
+            dir = parent;
+        }
+        parts.reverse();
+        parts.join("\u{1}")
+    }
+
+    fn row_key(&self, row: RowRef) -> String {
+        match row {
+            RowRef::Dir(d) => format!("d{}", self.dir_key(d)),
+            RowRef::File { file, .. } => {
+                format!("f{}\u{1}{}", self.files[file].pr, self.files[file].path)
+            }
+        }
+    }
+
+    /// After a refresh, sets this (freshly fetched) view up the way `old`
+    /// was: scope, filter, hidden files, folds, order, the row under the
+    /// cursor and an open diff.
+    pub fn carry_over(&mut self, old: &FilesView) {
+        self.scope = old.scope;
+        self.hide_viewed = old.hide_viewed;
+        self.diff.split.set_share(old.diff.split.share());
+        self.filter = old.filter.clone();
+        let folded: HashSet<String> = old.collapsed.iter().map(|&d| old.dir_key(d)).collect();
+        self.collapsed = (0..self.dirs.len())
+            .filter(|&d| folded.contains(&self.dir_key(d)))
+            .collect();
+        if old.top_down != self.top_down {
+            self.flip_order();
+        }
+        if old.order_mode {
+            self.order_mode = true;
+            self.ask_prognost();
+        }
+        let old_rows = old.rows();
+        let key = old
+            .table
+            .selected()
+            .and_then(|i| old_rows.get(i))
+            .map(|&r| old.row_key(r));
+        let at = key.and_then(|key| self.rows().iter().position(|&r| self.row_key(r) == key));
+        self.table.select(at.or(old.table.selected()));
+        self.clamp();
+        self.diff.open = old.diff.open;
     }
 
     fn file_visible(&self, file: usize) -> bool {
@@ -496,7 +565,14 @@ impl FilesView {
         self.order_mode = !self.order_mode;
         self.table.select(Some(0));
         self.clamp();
-        if self.order_mode && self.prognost.is_none() && !self.sources.is_empty() {
+        if self.order_mode {
+            self.ask_prognost();
+        }
+    }
+
+    /// Asks prognost, in the background and once, to refine the order.
+    fn ask_prognost(&mut self) {
+        if self.prognost.is_none() && !self.sources.is_empty() {
             let (tx, rx) = mpsc::channel();
             let files = self.files.clone();
             let per_pr = files_per_pr(&self.dirs, &self.pr_roots);
@@ -585,8 +661,9 @@ impl FilesView {
             .map(|&pr| self.order_by[pr])
             .collect();
         let calls = by.contains(&OrderBy::Prognost);
+        let asking = format!("by kind · {} asking prognost…", ui::spinner());
         let how = if by.contains(&OrderBy::Asking) {
-            "by kind · asking prognost…"
+            asking.as_str()
         } else if calls {
             "by calls (prognost)"
         } else {
@@ -1345,7 +1422,7 @@ fn draw_diff(f: &mut ratatui::Frame<'_>, area: Rect, app: &mut FilesView) {
         |text: String| Paragraph::new(Span::styled(text, theme::muted())).block(block.clone());
     match app.diff.patches.get(&pf.pr) {
         None | Some(Patches::Loading) => {
-            f.render_widget(note("fetching the diff…".to_string()), area);
+            f.render_widget(note(format!("{} fetching the diff…", ui::spinner())), area);
         }
         Some(Patches::Failed(e)) => f.render_widget(note(e.clone()), area),
         Some(Patches::Loaded(map)) => match map.get(&pf.path).and_then(|p| p.as_deref()) {
@@ -1547,11 +1624,10 @@ fn draw(f: &mut ratatui::Frame<'_>, area: Rect, app: &mut FilesView) {
     .highlight_symbol(Line::from(Span::styled("▌", theme::accent())))
     .highlight_spacing(HighlightSpacing::Always);
     let (list_area, diff_area) = if app.diff.open {
-        let [list, diff] =
-            Layout::horizontal([Constraint::Percentage(40), Constraint::Percentage(60)])
-                .areas(list_area);
+        let [list, diff] = app.diff.split.areas(list_area);
         (list, Some(diff))
     } else {
+        app.diff.split.hide();
         (list_area, None)
     };
     f.render_stateful_widget(table, list_area, &mut app.table);
@@ -1868,6 +1944,33 @@ mod tests {
         a.handle_key(KeyCode::Char('H'));
         assert!(a.is_modal() && !a.hide_viewed);
         assert_eq!(a.files[0].viewed, ViewedState::Unviewed);
+    }
+
+    #[test]
+    fn a_refresh_keeps_the_filter_hidden_files_and_the_row_under_the_cursor() {
+        let mut old = app(files(&["src/a.rs", "src/b.rs", "docs/x.md"]), true);
+        old.clamp();
+        for c in "/rs".chars() {
+            old.handle_key(KeyCode::Char(c));
+        }
+        old.handle_key(KeyCode::Enter);
+        while old.selected_file().map(|f| old.files[f].path.as_str()) != Some("src/b.rs") {
+            old.handle_key(KeyCode::Char('j'));
+        }
+
+        // Someone pushed a file that sorts before it.
+        let mut new = app(
+            files(&["src/a.rs", "src/a2.rs", "src/b.rs", "docs/x.md"]),
+            false,
+        );
+        new.clamp();
+        new.carry_over(&old);
+        assert!(new.hide_viewed);
+        assert_eq!(new.filter.text, "rs");
+        assert_eq!(
+            new.selected_file().map(|f| new.files[f].path.as_str()),
+            Some("src/b.rs")
+        );
     }
 
     #[test]
