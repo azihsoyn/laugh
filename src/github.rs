@@ -717,14 +717,27 @@ fn fill_failed_steps(contexts: &mut [RawContext]) -> Result<()> {
     Ok(())
 }
 
-/// Every changed file's unified diff, by path, from the REST files list.
-/// GitHub leaves `patch` out for binary files and very large diffs.
+/// One changed file as the REST files list has it.
+#[derive(Debug, Clone, Deserialize)]
+pub struct FileDiff {
+    /// The unified diff; GitHub leaves it out for binary files and very
+    /// large diffs.
+    pub patch: Option<String>,
+    /// `added`, `removed`, `modified`, `renamed`, …
+    pub status: String,
+    /// Where a renamed file came from.
+    #[serde(rename = "previous_filename")]
+    pub previous: Option<String>,
+}
+
+/// Every changed file's diff, by path, from the REST files list.
 #[tracing::instrument(skip_all, fields(pr = %format!("{owner}/{repo}#{pr}")), err)]
-pub fn fetch_patches(owner: &str, repo: &str, pr: u64) -> Result<HashMap<String, Option<String>>> {
+pub fn fetch_patches(owner: &str, repo: &str, pr: u64) -> Result<HashMap<String, FileDiff>> {
     #[derive(Deserialize)]
     struct File {
         filename: String,
-        patch: Option<String>,
+        #[serde(flatten)]
+        diff: FileDiff,
     }
     let output = Command::new("gh")
         .args([
@@ -732,7 +745,7 @@ pub fn fetch_patches(owner: &str, repo: &str, pr: u64) -> Result<HashMap<String,
             "--paginate",
             &format!("repos/{owner}/{repo}/pulls/{pr}/files?per_page=100"),
             "--jq",
-            ".[] | {filename, patch}",
+            ".[] | {filename, patch, status, previous_filename}",
         ])
         .output()
         .context("failed to run `gh`")?;
@@ -747,9 +760,68 @@ pub fn fetch_patches(owner: &str, repo: &str, pr: u64) -> Result<HashMap<String,
         .filter(|l| !l.trim().is_empty())
         .map(|l| {
             let f: File = serde_json::from_str(l).context("unexpected files response")?;
-            Ok((f.filename, f.patch))
+            Ok((f.filename, f.diff))
         })
         .collect()
+}
+
+/// The commit a PR branched from: what its diff is taken against.
+#[tracing::instrument(skip(owner, repo), err)]
+pub fn merge_base(owner: &str, repo: &str, base: &str, head: &str) -> Result<String> {
+    let output = Command::new("gh")
+        .args([
+            "api",
+            &format!("repos/{owner}/{repo}/compare/{base}...{head}"),
+            "--jq",
+            ".merge_base_commit.sha",
+        ])
+        .output()
+        .context("failed to run `gh`")?;
+    if !output.status.success() {
+        bail!(
+            "couldn't find where the PR branched off: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+/// A file's bytes as of commit `rev`.
+#[tracing::instrument(skip(owner, repo), err)]
+pub fn fetch_file(owner: &str, repo: &str, path: &str, rev: &str) -> Result<Vec<u8>> {
+    let output = Command::new("gh")
+        .args([
+            "api",
+            "-H",
+            // `raw+json` makes gh treat the bytes as text and mangle them.
+            "Accept: application/vnd.github.raw",
+            &format!(
+                "repos/{owner}/{repo}/contents/{}?ref={rev}",
+                encode_path(path)
+            ),
+        ])
+        .output()
+        .context("failed to run `gh`")?;
+    if !output.status.success() {
+        bail!(
+            "couldn't fetch {path}: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(output.stdout)
+}
+
+/// Percent-encodes a repository path for a URL, keeping its slashes.
+fn encode_path(path: &str) -> String {
+    let mut out = String::new();
+    for b in path.bytes() {
+        if b.is_ascii_alphanumeric() || b"-._~/".contains(&b) {
+            out.push(b as char);
+        } else {
+            out.push_str(&format!("%{b:02X}"));
+        }
+    }
+    out
 }
 
 /// The raw log of a GitHub Actions job.
@@ -797,4 +869,16 @@ pub fn infer_repo() -> Result<(String, String)> {
         .split_once('/')
         .map(|(o, r)| (o.to_string(), r.to_string()))
         .with_context(|| format!("unexpected `gh repo view` output: {name_with_owner}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn paths_are_encoded_for_the_contents_api() {
+        assert_eq!(encode_path("img/a b.webp"), "img/a%20b.webp");
+        assert_eq!(encode_path("画像/x.png"), "%E7%94%BB%E5%83%8F/x.png");
+        assert_eq!(encode_path("a#1?.png"), "a%231%3F.png");
+    }
 }

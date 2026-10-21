@@ -15,7 +15,7 @@ use crate::checks_view::ChecksView;
 use crate::files_view::{FilesView, OpenRequest};
 use crate::term::{self, Term, with_terminal};
 use crate::threads_view::ThreadsView;
-use crate::{logo, prefs, theme, ui};
+use crate::{graphics, logo, prefs, theme, ui};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Screen {
@@ -309,6 +309,7 @@ fn run_loaded(
         }
     }
     let result = event_loop(terminal, &mut app, &mut prefs);
+    let _ = graphics::clear(terminal.backend_mut());
     if app.files.pending() > 0 {
         app.screen = Screen::Files;
         app.help = false;
@@ -350,12 +351,19 @@ fn event_loop(terminal: &mut Term, app: &mut PrApp, prefs: &mut prefs::Prefs) ->
             app.checks.tick();
         }
         terminal.draw(|f| draw(f, app))?;
+        // Pictures the terminal draws itself sit above the text, so they
+        // make way for the help and for dialogs.
+        graphics::flush(terminal.backend_mut(), !app.help && !app.files.is_modal())?;
 
         if !event::poll(Duration::from_millis(100))? {
             continue;
         }
         let key = match event::read()? {
             Event::Key(key) if key.kind == KeyEventKind::Press => key,
+            Event::Resize(..) => {
+                graphics::forget_placements();
+                continue;
+            }
             Event::Mouse(mouse) => {
                 handle_mouse(
                     app,
@@ -442,6 +450,7 @@ fn open_externally(terminal: &mut Term, app: &PrApp, request: &OpenRequest) -> R
         )
         .status();
     term::resume(terminal)?;
+    graphics::forget_placements();
     Ok(match status {
         Ok(s) if s.success() => format!("opened {}", request.path),
         Ok(s) => format!("LAUGH_OPEN_CMD exited with {}", s.code().unwrap_or(-1)),
