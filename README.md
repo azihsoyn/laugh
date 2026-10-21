@@ -162,6 +162,11 @@ work the same in either view.
 without a checkout. `J` / `K` scroll it, moving the cursor follows it to the
 next file, and `Esc` closes it.
 
+Images (PNG, JPEG, GIF, WebP, BMP, ICO) have no diff on GitHub, so laugh
+fetches both sides and draws them in the pane, before and after, with their
+sizes and how many pixels changed. `c` dims everything that stayed the same,
+so the change stands out; `p` opens both full size in your image viewer.
+
 To open files your own way instead, set `LAUGH_OPEN_CMD`. `⏎` then runs it
 with `sh -c`, handing it the terminal until it exits, so a pager or an
 editor works. The path is `$1` and `$LAUGH_FILE`, alongside `$LAUGH_REPO`
@@ -250,6 +255,7 @@ link.
 | `m` with a filter | viewed: every match (asks first) |
 | `⏎` on a file | its diff (or `LAUGH_OPEN_CMD`) |
 | `J` `K` · `Esc` | scroll the diff · close it |
+| `c` · `p` on an image | changes only · open full size |
 
 | Threads | |
 |---|---|

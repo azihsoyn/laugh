@@ -5,6 +5,7 @@ mod format;
 mod generated;
 mod github;
 mod handoff;
+mod image_diff;
 mod logo;
 mod model;
 mod pr_app;

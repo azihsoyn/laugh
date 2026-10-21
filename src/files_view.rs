@@ -1,6 +1,9 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::process::{Command, Stdio};
 use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::{Arc, Mutex};
 use std::thread;
+use std::time::{Duration, Instant};
 
 use anyhow::{Result, bail};
 use crossterm::event::KeyCode;
@@ -11,6 +14,7 @@ use ratatui::widgets::{Cell, Clear, HighlightSpacing, Paragraph, Row, Table, Tab
 
 use regex::{Regex, RegexBuilder};
 
+use crate::image_diff::{self, ImageDiff};
 use crate::{generated, github};
 
 use crate::model::{PrFile, ViewedState};
@@ -266,11 +270,23 @@ impl Filter {
 /// One PR's diffs, by path, as GitHub serves them.
 enum Patches {
     Loading,
-    Loaded(HashMap<String, Option<String>>),
+    Loaded(HashMap<String, github::FileDiff>),
     Failed(String),
 }
 
-type PatchResult = (usize, Result<HashMap<String, Option<String>>, String>);
+type PatchResult = (usize, Result<HashMap<String, github::FileDiff>, String>);
+
+/// An image file's two sides, fetched the first time it's shown.
+enum Pictures {
+    Loading,
+    Ready(Box<ImageDiff>),
+    Failed(String),
+}
+
+type ImageResult = (usize, Result<ImageDiff, String>);
+
+/// What the pictures were last drawn for: file, size and `c`.
+type DrawnKey = (usize, u16, u16, bool);
 
 /// The diff shown beside the tree: the selected file's patch, fetched per
 /// PR the first time it's needed.
@@ -286,11 +302,25 @@ struct DiffPane {
     patches: HashMap<usize, Patches>,
     tx: Sender<PatchResult>,
     rx: Receiver<PatchResult>,
+    /// Image files' pictures, by file.
+    images: HashMap<usize, Pictures>,
+    image_tx: Sender<ImageResult>,
+    image_rx: Receiver<ImageResult>,
+    /// The commit each PR branched from, once looked up.
+    merge_bases: Arc<Mutex<HashMap<usize, String>>>,
+    /// `c`: dim what stayed the same in a picture.
+    changes: bool,
+    /// When the shown file last changed, so skimming past images with the
+    /// diff open doesn't fetch every one of them.
+    since: Instant,
+    /// The pictures as last drawn, so they aren't scaled every frame.
+    drawn: Option<(DrawnKey, Vec<Line<'static>>)>,
 }
 
 impl Default for DiffPane {
     fn default() -> Self {
         let (tx, rx) = mpsc::channel();
+        let (image_tx, image_rx) = mpsc::channel();
         DiffPane {
             open: false,
             scroll: 0,
@@ -300,6 +330,13 @@ impl Default for DiffPane {
             patches: HashMap::new(),
             tx,
             rx,
+            images: HashMap::new(),
+            image_tx,
+            image_rx,
+            merge_bases: Arc::default(),
+            changes: false,
+            since: Instant::now(),
+            drawn: None,
         }
     }
 }
@@ -943,6 +980,7 @@ impl FilesView {
         self.drain_outcomes();
         self.drain_prognost();
         self.drain_patches();
+        self.drain_images();
     }
 
     fn selected_file(&self) -> Option<usize> {
@@ -981,6 +1019,152 @@ impl FilesView {
         thread::spawn(move || {
             let result = github::fetch_patches(&owner, &repo, number).map_err(|e| format!("{e:#}"));
             let _ = tx.send((pr, result));
+        });
+    }
+
+    /// The selected file's change, once its PR's diffs are in.
+    fn selected_diff(&self) -> Option<(usize, &github::FileDiff)> {
+        let file = self.selected_file()?;
+        let pf = &self.files[file];
+        match self.diff.patches.get(&pf.pr)? {
+            Patches::Loaded(map) => Some((file, map.get(&pf.path)?)),
+            _ => None,
+        }
+    }
+
+    /// True when the diff pane shows pictures rather than a patch.
+    fn showing_image(&self) -> bool {
+        self.diff.open
+            && self.selected_diff().is_some_and(|(file, d)| {
+                d.patch.is_none() && image_diff::is_image(&self.files[file].path)
+            })
+    }
+
+    /// True when the shown pictures are the same size, so `c` can pick out
+    /// what changed between them.
+    fn can_show_changes(&self) -> bool {
+        self.showing_image()
+            && self.selected_file().is_some_and(|file| {
+                matches!(self.diff.images.get(&file), Some(Pictures::Ready(d)) if d.comparable())
+            })
+    }
+
+    /// `p`: the shown image's two sides, full size, in the system's image
+    /// viewer.
+    fn open_pictures(&mut self) {
+        let Some(file) = self.selected_file() else {
+            return;
+        };
+        let Some(Pictures::Ready(diff)) = self.diff.images.get(&file) else {
+            self.status = Some("the image is still loading".to_string());
+            return;
+        };
+        if diff.files.is_empty() {
+            self.status = Some("couldn't save the image to open it".to_string());
+            return;
+        }
+        // Whatever the opener prints would land on top of the UI.
+        let run = |cmd: &mut Command| {
+            cmd.stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .map(drop)
+        };
+        let spawned = if cfg!(target_os = "macos") {
+            run(Command::new("open").args(&diff.files))
+        } else if cfg!(windows) {
+            diff.files
+                .iter()
+                .try_for_each(|f| run(Command::new("cmd").args(["/C", "start", ""]).arg(f)))
+        } else {
+            diff.files
+                .iter()
+                .try_for_each(|f| run(Command::new("xdg-open").arg(f)))
+        };
+        self.status = Some(match spawned {
+            Ok(()) => "opened in the image viewer".to_string(),
+            Err(e) => format!("couldn't open the image viewer: {e}"),
+        });
+    }
+
+    /// Collects fetched pictures, and starts fetching the selected image's
+    /// once the cursor has rested on it for a moment.
+    fn drain_images(&mut self) {
+        for (file, result) in self.diff.image_rx.try_iter() {
+            let state = match result {
+                Ok(diff) => Pictures::Ready(Box::new(diff)),
+                Err(e) => Pictures::Failed(e),
+            };
+            self.diff.images.insert(file, state);
+            self.diff.drawn = None;
+        }
+        if !self.showing_image() || self.diff.since.elapsed() < Duration::from_millis(200) {
+            return;
+        }
+        let Some((file, change)) = self.selected_diff() else {
+            return;
+        };
+        if self.diff.images.contains_key(&file) {
+            return;
+        }
+        let pf = &self.files[file];
+        let Some(source) = self.sources.get(pf.pr) else {
+            return;
+        };
+        let before_path = match change.status.as_str() {
+            "added" => None,
+            "renamed" => Some(change.previous.clone().unwrap_or_else(|| pf.path.clone())),
+            _ => Some(pf.path.clone()),
+        };
+        let after_path = (change.status != "removed").then(|| pf.path.clone());
+        let shown = pf.path.clone();
+        let number = source.number;
+        let pr = pf.pr;
+        let (owner, repo) = (source.owner.clone(), source.repo.clone());
+        let (base, head) = (source.base.clone(), source.head.clone());
+        let bases = Arc::clone(&self.diff.merge_bases);
+        let tx = self.diff.image_tx.clone();
+        self.diff.images.insert(file, Pictures::Loading);
+        thread::spawn(move || {
+            let fetch = |path: &str, rev: &str| {
+                github::fetch_file(&owner, &repo, path, rev).map_err(|e| format!("{e:#}"))
+            };
+            let result = (|| {
+                let before = match before_path {
+                    Some(path) => {
+                        let known = bases.lock().ok().and_then(|b| b.get(&pr).cloned());
+                        let from = match known {
+                            Some(from) => from,
+                            None => {
+                                let from = github::merge_base(&owner, &repo, &base, &head)
+                                    .map_err(|e| format!("{e:#}"))?;
+                                if let Ok(mut b) = bases.lock() {
+                                    b.insert(pr, from.clone());
+                                }
+                                from
+                            }
+                        };
+                        Some(fetch(&path, &from)?)
+                    }
+                    None => None,
+                };
+                let after = match &after_path {
+                    Some(path) => Some(fetch(path, &head)?),
+                    None => None,
+                };
+                let mut diff = image_diff::compare(before.as_deref(), after.as_deref())?;
+                let here = format!("{owner}-{repo}-{number}");
+                let name = after_path.as_deref().unwrap_or(&shown);
+                diff.files = [("before", &before), ("after", &after)]
+                    .into_iter()
+                    .filter_map(|(side, bytes)| {
+                        image_diff::save(bytes.as_ref()?, &here, side, name)
+                    })
+                    .collect();
+                Ok(diff)
+            })();
+            let _ = tx.send((file, result));
         });
     }
 
@@ -1158,6 +1342,14 @@ impl FilesView {
                     self.diff.scroll = self.diff.scroll.saturating_sub(10);
                     return;
                 }
+                KeyCode::Char('c') if self.can_show_changes() => {
+                    self.diff.changes = !self.diff.changes;
+                    return;
+                }
+                KeyCode::Char('p') if self.showing_image() => {
+                    self.open_pictures();
+                    return;
+                }
                 _ => {}
             }
         }
@@ -1254,6 +1446,18 @@ impl FilesView {
         }
         let mut hints = match self.current() {
             Some(RowRef::Dir(_)) => vec![("V", "viewed: everything inside"), ("⏎", "fold"), hide],
+            Some(RowRef::File { .. }) if self.showing_image() => {
+                let mut hints = vec![("v", "viewed")];
+                if self.can_show_changes() {
+                    hints.push(if self.diff.changes {
+                        ("c", "whole picture")
+                    } else {
+                        ("c", "changes only")
+                    });
+                }
+                hints.extend([("p", "open full size"), ("esc", "close"), hide]);
+                hints
+            }
             Some(RowRef::File { .. }) if self.diff.open => {
                 vec![
                     ("v", "viewed"),
@@ -1406,6 +1610,7 @@ fn draw_diff(f: &mut ratatui::Frame<'_>, area: Rect, app: &mut FilesView) {
     if app.diff.file != Some(file) {
         app.diff.file = Some(file);
         app.diff.scroll = 0;
+        app.diff.since = Instant::now();
     }
     let pf = &app.files[file];
     // Long paths lose their start, not the file name.
@@ -1420,12 +1625,35 @@ fn draw_diff(f: &mut ratatui::Frame<'_>, area: Rect, app: &mut FilesView) {
     let inner = block.inner(area);
     let note =
         |text: String| Paragraph::new(Span::styled(text, theme::muted())).block(block.clone());
+    if app.showing_image() {
+        let pane = &mut app.diff;
+        match pane.images.get(&file) {
+            None | Some(Pictures::Loading) => {
+                f.render_widget(note(format!("{} fetching the image…", ui::spinner())), area);
+            }
+            Some(Pictures::Failed(e)) => f.render_widget(note(e.clone()), area),
+            Some(Pictures::Ready(diff)) => {
+                let key = (file, inner.width, inner.height, pane.changes);
+                if pane.drawn.as_ref().is_none_or(|(k, _)| *k != key) {
+                    let lines = image_lines(diff, inner.width, inner.height, pane.changes);
+                    pane.drawn = Some((key, lines));
+                }
+                let lines = pane
+                    .drawn
+                    .as_ref()
+                    .map(|(_, l)| l.clone())
+                    .unwrap_or_default();
+                f.render_widget(Paragraph::new(lines).block(block), area);
+            }
+        }
+        return;
+    }
     match app.diff.patches.get(&pf.pr) {
         None | Some(Patches::Loading) => {
             f.render_widget(note(format!("{} fetching the diff…", ui::spinner())), area);
         }
         Some(Patches::Failed(e)) => f.render_widget(note(e.clone()), area),
-        Some(Patches::Loaded(map)) => match map.get(&pf.path).and_then(|p| p.as_deref()) {
+        Some(Patches::Loaded(map)) => match map.get(&pf.path).and_then(|d| d.patch.as_deref()) {
             None => f.render_widget(
                 note(
                     "GitHub doesn't show a diff for this file — it's binary, too large, or only renamed."
@@ -1446,6 +1674,90 @@ fn draw_diff(f: &mut ratatui::Frame<'_>, area: Rect, app: &mut FilesView) {
             }
         },
     }
+}
+
+/// An image's change: sizes on top, then before and after side by side
+/// (one above the other when the pane is narrow).
+fn image_lines(diff: &ImageDiff, width: u16, height: u16, changes: bool) -> Vec<Line<'static>> {
+    let describe = |label: &str, p: &Option<image_diff::Picture>| match p {
+        Some(p) => format!(
+            "{label} {}×{} · {}",
+            p.width,
+            p.height,
+            image_diff::size(p.bytes)
+        ),
+        None => String::new(),
+    };
+    let mut head = match (&diff.before, &diff.after) {
+        (None, _) => vec![Span::styled("added  ", Style::default().fg(theme::GREEN))],
+        (_, None) => vec![Span::styled("removed  ", Style::default().fg(theme::RED))],
+        _ => Vec::new(),
+    };
+    let sides: Vec<String> = [
+        describe("before", &diff.before),
+        describe("after", &diff.after),
+    ]
+    .into_iter()
+    .filter(|s| !s.is_empty())
+    .collect();
+    head.push(Span::styled(sides.join("  →  "), theme::muted()));
+    match diff.changed_share {
+        Some(0.0) => head.push(Span::styled("  · no visible change", theme::muted())),
+        Some(share) => {
+            let pct = if share < 0.001 {
+                "<0.1%".to_string()
+            } else {
+                format!("{:.1}%", share * 100.0)
+            };
+            head.push(Span::styled(
+                format!("  · {pct} of pixels changed"),
+                Style::default().fg(theme::YELLOW),
+            ));
+        }
+        None if diff.before.is_some() && diff.after.is_some() => {
+            head.push(Span::styled("  · sizes differ", theme::muted()));
+        }
+        None => {}
+    }
+    let mut lines = vec![Line::from(head), Line::default()];
+    let rows = height.saturating_sub(3);
+    let label = |text: &str, cols: u16| {
+        Span::styled(
+            format!("{text:^width$}", width = cols as usize),
+            theme::faint(),
+        )
+    };
+    let both = diff.before.is_some() && diff.after.is_some();
+    if both && image_diff::side_by_side(diff, width, rows) {
+        let cols = (width - 3) / 2;
+        lines.push(Line::from(vec![
+            label("before", cols),
+            Span::raw("   "),
+            label("after", cols),
+        ]));
+        let before = image_diff::draw(diff, false, changes, cols, rows);
+        let after = image_diff::draw(diff, true, changes, cols, rows);
+        for (b, a) in before.into_iter().zip(after) {
+            let mut spans = b.spans;
+            spans.push(Span::raw("   "));
+            spans.extend(a.spans);
+            lines.push(Line::from(spans));
+        }
+    } else if both {
+        let rows = rows.saturating_sub(1) / 2;
+        for (text, after) in [("before", false), ("after", true)] {
+            lines.push(Line::from(label(text, width)));
+            lines.extend(image_diff::draw(diff, after, changes, width, rows));
+        }
+    } else {
+        let after = diff.after.is_some();
+        lines.push(Line::from(label(
+            if after { "after" } else { "before" },
+            width,
+        )));
+        lines.extend(image_diff::draw(diff, after, changes, width, rows));
+    }
+    lines
 }
 
 fn draw(f: &mut ratatui::Frame<'_>, area: Rect, app: &mut FilesView) {
