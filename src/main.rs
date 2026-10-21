@@ -4,6 +4,7 @@ mod files_view;
 mod format;
 mod generated;
 mod github;
+mod graphics;
 mod handoff;
 mod image_diff;
 mod logo;

@@ -164,7 +164,10 @@ next file, and `Esc` closes it.
 
 Images (PNG, JPEG, GIF, WebP, BMP, ICO) have no diff on GitHub, so laugh
 fetches both sides and draws them in the pane, before and after, with their
-sizes and how many pixels changed. `c` dims everything that stayed the same,
+sizes and how many pixels changed. In kitty, Ghostty, WezTerm or herdr
+(passed on to the terminal around it) the terminal draws them itself, at
+full sharpness, through the kitty graphics protocol; elsewhere they're
+drawn with half blocks. `LAUGH_GRAPHICS=kitty` or `=blocks` picks one. `c` dims everything that stayed the same,
 so the change stands out; `p` opens both full size in your image viewer.
 
 To open files your own way instead, set `LAUGH_OPEN_CMD`. `⏎` then runs it

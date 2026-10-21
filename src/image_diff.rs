@@ -1,13 +1,16 @@
 //! Pictures in the diff pane. GitHub has no diff for an image, so laugh
-//! fetches the file from both sides of the PR and draws them in the
-//! terminal with half blocks (`▀`: a cell is two pixels, one above the
-//! other), before beside after. `c` dims everything that stayed the same,
+//! fetches the file from both sides of the PR and shows them before beside
+//! after: drawn by the terminal itself where it can (see [`graphics`]),
+//! otherwise with half blocks (`▀`: a cell is two pixels, one above the
+//! other). `c` dims everything that stayed the same,
 //! so what changed stands out.
 
+use std::io::Cursor;
 use std::path::PathBuf;
 
 use image::imageops::{self, FilterType};
-use image::{GrayImage, Luma, Rgba, RgbaImage};
+use image::{DynamicImage, GrayImage, ImageFormat, Luma, Rgba, RgbaImage};
+use ratatui::layout::Rect;
 use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
 
@@ -16,6 +19,12 @@ const EXTENSIONS: &[&str] = &["png", "jpg", "jpeg", "gif", "webp", "bmp", "ico"]
 /// Pictures are kept no bigger than this: a pane never shows more, and a
 /// PR full of screenshots shouldn't fill the memory.
 const KEEP: u32 = 320;
+
+/// What the terminal is sent, when it draws pictures itself: plenty for a
+/// pane, small enough to send quickly.
+const SHARP: u32 = 1600;
+
+use crate::graphics;
 
 /// How far a channel may move before a pixel counts as changed, so lossy
 /// re-encoding alone doesn't light everything up.
@@ -32,6 +41,14 @@ pub struct Picture {
     pub height: u32,
     pub bytes: usize,
     small: RgbaImage,
+    /// For a terminal that draws pictures itself.
+    sharp: Option<Sharp>,
+}
+
+struct Sharp {
+    plain: graphics::Image,
+    /// With what stayed the same dimmed, when there's something to compare.
+    changes: Option<graphics::Image>,
 }
 
 pub struct ImageDiff {
@@ -69,8 +86,8 @@ fn fit(width: u32, height: u32, max: u32) -> (u32, u32) {
     )
 }
 
-fn shrink(img: &RgbaImage) -> RgbaImage {
-    let (w, h) = fit(img.width(), img.height(), KEEP);
+fn shrink(img: &RgbaImage, max: u32) -> RgbaImage {
+    let (w, h) = fit(img.width(), img.height(), max);
     if (w, h) == img.dimensions() {
         img.clone()
     } else {
@@ -78,12 +95,60 @@ fn shrink(img: &RgbaImage) -> RgbaImage {
     }
 }
 
+/// A full-size change mask at `max`: shrinking blurs a lone changed pixel
+/// into its neighbours, and any trace of one keeps the spot lit, so small
+/// changes don't vanish.
+fn shrink_mask(mask: &GrayImage, max: u32) -> GrayImage {
+    let (w, h) = fit(mask.width(), mask.height(), max);
+    let small = imageops::resize(mask, w, h, FilterType::Triangle);
+    GrayImage::from_fn(w, h, |x, y| {
+        Luma([if small.get_pixel(x, y).0[0] > 0 {
+            255
+        } else {
+            0
+        }])
+    })
+}
+
+fn png(img: RgbaImage) -> graphics::Image {
+    let mut out = Cursor::new(Vec::new());
+    // Encoding pixels already in memory can't fail.
+    let _ = DynamicImage::ImageRgba8(img).write_to(&mut out, ImageFormat::Png);
+    graphics::Image::new(out.into_inner())
+}
+
+/// The picture to send the terminal, and with `mask` the same with what
+/// didn't change dimmed.
+fn sharpen(img: &RgbaImage, mask: Option<&GrayImage>) -> Sharp {
+    let big = shrink(img, SHARP);
+    let changes = mask.map(|mask| {
+        let mask = shrink_mask(mask, SHARP);
+        let mut dimmed = big.clone();
+        for (x, y, p) in dimmed.enumerate_pixels_mut() {
+            if mask.get_pixel(x, y).0[0] == 0 {
+                let [r, g, b, a] = p.0;
+                *p = Rgba([r / 4, g / 4, b / 4, a]);
+            }
+        }
+        png(dimmed)
+    });
+    Sharp {
+        plain: png(big),
+        changes,
+    }
+}
+
 /// Decodes both sides (either may be missing: an added or removed file)
-/// and works out where they differ.
-pub fn compare(before: Option<&[u8]>, after: Option<&[u8]>) -> Result<ImageDiff, String> {
+/// and works out where they differ. With `sharp`, also makes what a
+/// terminal that draws pictures itself is sent.
+pub fn compare(
+    before: Option<&[u8]>,
+    after: Option<&[u8]>,
+    sharp: bool,
+) -> Result<ImageDiff, String> {
     let before = before.map(decode).transpose()?;
     let after = after.map(decode).transpose()?;
-    let (mut changed, mut changed_share) = (None, None);
+    let (mut changed, mut changed_share, mut full_mask) = (None, None, None);
     if let (Some((a, _)), Some((b, _))) = (&before, &after)
         && a.dimensions() == b.dimensions()
     {
@@ -97,24 +162,16 @@ pub fn compare(before: Option<&[u8]>, after: Option<&[u8]>) -> Result<ImageDiff,
             }
         }
         changed_share = Some(count as f64 / f64::from((a.width() * a.height()).max(1)));
-        let (w, h) = fit(a.width(), a.height(), KEEP);
-        // Shrinking blurs a lone changed pixel into its neighbours; any
-        // trace of one keeps the spot lit, so small changes don't vanish.
-        let small = imageops::resize(&mask, w, h, FilterType::Triangle);
-        changed = Some(GrayImage::from_fn(w, h, |x, y| {
-            Luma([if small.get_pixel(x, y).0[0] > 0 {
-                255
-            } else {
-                0
-            }])
-        }));
+        changed = Some(shrink_mask(&mask, KEEP));
+        full_mask = Some(mask);
     }
     let picture = |side: Option<(RgbaImage, usize)>| {
         side.map(|(img, bytes)| Picture {
             width: img.width(),
             height: img.height(),
             bytes,
-            small: shrink(&img),
+            small: shrink(&img, KEEP),
+            sharp: sharp.then(|| sharpen(&img, full_mask.as_ref())),
         })
     };
     Ok(ImageDiff {
@@ -137,23 +194,21 @@ pub fn save(bytes: &[u8], pr: &str, side: &str, path: &str) -> Option<PathBuf> {
     Some(file)
 }
 
-/// How much one side gets scaled to fit `cols × rows` cells.
-fn scale(picture: &Picture, cols: u16, rows: u16) -> f64 {
-    let (w, h) = (
-        f64::from(picture.small.width()),
-        f64::from(picture.small.height()),
-    );
-    (f64::from(cols) / w).min(f64::from(rows) * 2.0 / h)
+/// How much one side gets scaled to fit `cols × rows` cells, `ratio`
+/// times taller than wide, counting a cell's width as one.
+fn scale(picture: &Picture, cols: u16, rows: u16, ratio: f64) -> f64 {
+    let (w, h) = (f64::from(picture.width), f64::from(picture.height));
+    (f64::from(cols) / w).min(f64::from(rows) * ratio / h)
 }
 
 /// True when the two sides come out bigger side by side in `cols × rows`
 /// than one above the other.
-pub fn side_by_side(diff: &ImageDiff, cols: u16, rows: u16) -> bool {
+pub fn side_by_side(diff: &ImageDiff, cols: u16, rows: u16, ratio: f64) -> bool {
     let smallest = |cols: u16, rows: u16| {
         [&diff.before, &diff.after]
             .into_iter()
             .flatten()
-            .map(|p| scale(p, cols, rows))
+            .map(|p| scale(p, cols, rows, ratio))
             .fold(f64::INFINITY, f64::min)
     };
     cols >= 2 * 16 + 3
@@ -244,6 +299,31 @@ pub fn draw(
     lines
 }
 
+/// For a terminal that draws pictures itself: the image to place, and the
+/// cells it covers within `cols × rows`, centred and not stretched.
+pub fn placement(
+    diff: &ImageDiff,
+    after: bool,
+    changes: bool,
+    cols: u16,
+    rows: u16,
+    ratio: f64,
+) -> Option<(Rect, graphics::Image)> {
+    let picture = if after { &diff.after } else { &diff.before };
+    let picture = picture.as_ref()?;
+    let sharp = picture.sharp.as_ref()?;
+    let image = if changes {
+        sharp.changes.as_ref().unwrap_or(&sharp.plain)
+    } else {
+        &sharp.plain
+    };
+    let s = scale(picture, cols, rows, ratio);
+    let w = ((f64::from(picture.width) * s).round() as u16).clamp(1, cols.max(1));
+    let h = ((f64::from(picture.height) * s / ratio).round() as u16).clamp(1, rows.max(1));
+    let area = Rect::new((cols - w) / 2, (rows - h) / 2, w, h);
+    Some((area, image.clone()))
+}
+
 /// `84 KB`, `1.2 MB`.
 pub fn size(bytes: usize) -> String {
     match bytes {
@@ -284,7 +364,7 @@ mod tests {
         }
         // A whisker of difference is noise, not change.
         after.put_pixel(9, 9, Rgba([250, 250, 250, 255]));
-        let diff = compare(Some(&png(before)), Some(&png(after))).unwrap();
+        let diff = compare(Some(&png(before)), Some(&png(after)), false).unwrap();
         assert!(diff.comparable());
         assert_eq!(diff.changed_share, Some(0.04));
         let mask = diff.changed.as_ref().unwrap();
@@ -295,7 +375,7 @@ mod tests {
     #[test]
     fn an_added_image_has_no_before_and_nothing_to_compare() {
         let after = RgbaImage::from_pixel(4, 2, Rgba([0, 0, 255, 255]));
-        let diff = compare(None, Some(&png(after))).unwrap();
+        let diff = compare(None, Some(&png(after)), false).unwrap();
         assert!(diff.before.is_none());
         assert!(!diff.comparable());
         let after = diff.after.as_ref().unwrap();
@@ -305,7 +385,7 @@ mod tests {
     #[test]
     fn a_picture_fills_its_box_without_stretching() {
         let wide = RgbaImage::from_pixel(400, 100, Rgba([0, 255, 0, 255]));
-        let diff = compare(None, Some(&png(wide))).unwrap();
+        let diff = compare(None, Some(&png(wide)), false).unwrap();
         // 40 columns wide → 10 pixels tall → 5 rows, centred in 11.
         let lines = draw(&diff, true, false, 40, 11);
         assert_eq!(lines.len(), 11);
@@ -324,7 +404,7 @@ mod tests {
         let before = RgbaImage::from_pixel(2, 2, Rgba([200, 200, 200, 255]));
         let mut after = before.clone();
         after.put_pixel(0, 0, Rgba([200, 0, 0, 255]));
-        let diff = compare(Some(&png(before)), Some(&png(after))).unwrap();
+        let diff = compare(Some(&png(before)), Some(&png(after)), false).unwrap();
         let cell = |changes: bool| {
             let lines = draw(&diff, true, changes, 2, 1);
             let spans = &lines[0].spans;
@@ -344,7 +424,7 @@ mod tests {
     #[test]
     fn big_pictures_are_kept_small() {
         let big = RgbaImage::from_pixel(1600, 900, Rgba([0, 0, 0, 255]));
-        let diff = compare(Some(&png(big.clone())), Some(&png(big))).unwrap();
+        let diff = compare(Some(&png(big.clone())), Some(&png(big)), false).unwrap();
         let after = diff.after.as_ref().unwrap();
         assert_eq!((after.width, after.height), (1600, 900));
         assert_eq!(after.small.dimensions(), (320, 180));

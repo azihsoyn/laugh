@@ -15,7 +15,7 @@ use ratatui::widgets::{Cell, Clear, HighlightSpacing, Paragraph, Row, Table, Tab
 use regex::{Regex, RegexBuilder};
 
 use crate::image_diff::{self, ImageDiff};
-use crate::{generated, github};
+use crate::{generated, github, graphics};
 
 use crate::model::{PrFile, ViewedState};
 use crate::reading_order::{self, Step};
@@ -285,8 +285,12 @@ enum Pictures {
 
 type ImageResult = (usize, Result<ImageDiff, String>);
 
-/// What the pictures were last drawn for: file, size and `c`.
-type DrawnKey = (usize, u16, u16, bool);
+/// What the pictures were last drawn for: file, size, `c`, and the shape
+/// of a cell (in hundredths) when the terminal draws them.
+type DrawnKey = (usize, u16, u16, bool, Option<u32>);
+
+/// The pane's lines, and the pictures the terminal places over them.
+type Drawn = (Vec<Line<'static>>, Vec<(Rect, graphics::Image)>);
 
 /// The diff shown beside the tree: the selected file's patch, fetched per
 /// PR the first time it's needed.
@@ -314,7 +318,7 @@ struct DiffPane {
     /// diff open doesn't fetch every one of them.
     since: Instant,
     /// The pictures as last drawn, so they aren't scaled every frame.
-    drawn: Option<(DrawnKey, Vec<Line<'static>>)>,
+    drawn: Option<(DrawnKey, Drawn)>,
 }
 
 impl Default for DiffPane {
@@ -1153,7 +1157,8 @@ impl FilesView {
                     Some(path) => Some(fetch(path, &head)?),
                     None => None,
                 };
-                let mut diff = image_diff::compare(before.as_deref(), after.as_deref())?;
+                let mut diff =
+                    image_diff::compare(before.as_deref(), after.as_deref(), graphics::enabled())?;
                 let here = format!("{owner}-{repo}-{number}");
                 let name = after_path.as_deref().unwrap_or(&shown);
                 diff.files = [("before", &before), ("after", &after)]
@@ -1633,17 +1638,26 @@ fn draw_diff(f: &mut ratatui::Frame<'_>, area: Rect, app: &mut FilesView) {
             }
             Some(Pictures::Failed(e)) => f.render_widget(note(e.clone()), area),
             Some(Pictures::Ready(diff)) => {
-                let key = (file, inner.width, inner.height, pane.changes);
+                let ratio = graphics::enabled().then(graphics::cell_ratio);
+                let key = (
+                    file,
+                    inner.width,
+                    inner.height,
+                    pane.changes,
+                    ratio.map(|r| (r * 100.0).round() as u32),
+                );
                 if pane.drawn.as_ref().is_none_or(|(k, _)| *k != key) {
-                    let lines = image_lines(diff, inner.width, inner.height, pane.changes);
-                    pane.drawn = Some((key, lines));
+                    let drawn = image_lines(diff, inner.width, inner.height, pane.changes, ratio);
+                    pane.drawn = Some((key, drawn));
                 }
-                let lines = pane
-                    .drawn
-                    .as_ref()
-                    .map(|(_, l)| l.clone())
-                    .unwrap_or_default();
-                f.render_widget(Paragraph::new(lines).block(block), area);
+                if let Some((_, (lines, places))) = &pane.drawn {
+                    f.render_widget(Paragraph::new(lines.clone()).block(block), area);
+                    for (at, image) in places {
+                        let at = Rect::new(inner.x + at.x, inner.y + at.y, at.width, at.height)
+                            .intersection(inner);
+                        graphics::want(image, at);
+                    }
+                }
             }
         }
         return;
@@ -1678,7 +1692,16 @@ fn draw_diff(f: &mut ratatui::Frame<'_>, area: Rect, app: &mut FilesView) {
 
 /// An image's change: sizes on top, then before and after side by side
 /// (one above the other when the pane is narrow).
-fn image_lines(diff: &ImageDiff, width: u16, height: u16, changes: bool) -> Vec<Line<'static>> {
+/// With `ratio` (a cell's height over its width) the pictures are left to
+/// the terminal: the lines leave room for them, and where each goes comes
+/// back beside them, relative to the pane.
+fn image_lines(
+    diff: &ImageDiff,
+    width: u16,
+    height: u16,
+    changes: bool,
+    ratio: Option<f64>,
+) -> Drawn {
     let describe = |label: &str, p: &Option<image_diff::Picture>| match p {
         Some(p) => format!(
             "{label} {}×{} · {}",
@@ -1728,15 +1751,35 @@ fn image_lines(diff: &ImageDiff, width: u16, height: u16, changes: bool) -> Vec<
         )
     };
     let both = diff.before.is_some() && diff.after.is_some();
-    if both && image_diff::side_by_side(diff, width, rows) {
+    // Half blocks make square pixels of a cell's two halves; a terminal
+    // drawing the picture itself needs the real shape of a cell.
+    let fit_ratio = ratio.unwrap_or(2.0);
+    let mut places = Vec::new();
+    // One side's picture in `cols × rows` at (`x`, `y`) of the pane.
+    let mut picture = |after: bool, x: u16, y: u16, cols: u16, rows: u16| match ratio {
+        Some(ratio) => {
+            if let Some((area, image)) =
+                image_diff::placement(diff, after, changes, cols, rows, ratio)
+            {
+                places.push((
+                    Rect::new(area.x + x, area.y + y, area.width, area.height),
+                    image,
+                ));
+            }
+            vec![Line::from(" ".repeat(cols as usize)); rows as usize]
+        }
+        None => image_diff::draw(diff, after, changes, cols, rows),
+    };
+    let top = lines.len() as u16 + 1;
+    if both && image_diff::side_by_side(diff, width, rows, fit_ratio) {
         let cols = (width - 3) / 2;
         lines.push(Line::from(vec![
             label("before", cols),
             Span::raw("   "),
             label("after", cols),
         ]));
-        let before = image_diff::draw(diff, false, changes, cols, rows);
-        let after = image_diff::draw(diff, true, changes, cols, rows);
+        let before = picture(false, 0, top, cols, rows);
+        let after = picture(true, cols + 3, top, cols, rows);
         for (b, a) in before.into_iter().zip(after) {
             let mut spans = b.spans;
             spans.push(Span::raw("   "));
@@ -1747,7 +1790,8 @@ fn image_lines(diff: &ImageDiff, width: u16, height: u16, changes: bool) -> Vec<
         let rows = rows.saturating_sub(1) / 2;
         for (text, after) in [("before", false), ("after", true)] {
             lines.push(Line::from(label(text, width)));
-            lines.extend(image_diff::draw(diff, after, changes, width, rows));
+            let y = lines.len() as u16;
+            lines.extend(picture(after, 0, y, width, rows));
         }
     } else {
         let after = diff.after.is_some();
@@ -1755,9 +1799,9 @@ fn image_lines(diff: &ImageDiff, width: u16, height: u16, changes: bool) -> Vec<
             if after { "after" } else { "before" },
             width,
         )));
-        lines.extend(image_diff::draw(diff, after, changes, width, rows));
+        lines.extend(picture(after, 0, top, width, rows));
     }
-    lines
+    (lines, places)
 }
 
 fn draw(f: &mut ratatui::Frame<'_>, area: Rect, app: &mut FilesView) {
