@@ -75,9 +75,9 @@ pub fn cell_ratio() -> f64 {
     cell_pixels().map_or(2.0, |(w, h)| h / w)
 }
 
-/// How wide a cell is in pixels, when known.
-pub fn cell_width() -> Option<u32> {
-    cell_pixels().map(|(w, _)| w.ceil() as u32)
+/// A cell's width and height in whole pixels, when known.
+pub fn cell_size() -> Option<(u32, u32)> {
+    cell_pixels().map(|(w, h)| (w.round() as u32, h.round() as u32))
 }
 
 #[derive(Default)]

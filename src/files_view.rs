@@ -1807,17 +1807,15 @@ fn image_lines(
     // Half blocks make square pixels of a cell's two halves; a terminal
     // drawing the picture itself needs the real shape of a cell.
     let fit_ratio = ratio.unwrap_or(2.0);
-    let cell_width = ratio.and(graphics::cell_width());
-    let mut places = Vec::new();
+    // Where each side goes, and whether it's the after side.
+    let mut sides = Vec::new();
     // One side's picture in `cols × rows` at (`x`, `y`) of the pane.
     let mut picture = |after: bool, x: u16, y: u16, cols: u16, rows: u16| match ratio {
         Some(ratio) => {
-            if let Some((area, image)) =
-                image_diff::placement(diff, after, changes, cols, rows, ratio, cell_width)
-            {
-                places.push((
+            if let Some(area) = image_diff::placement(diff, after, cols, rows, ratio) {
+                sides.push((
                     Rect::new(area.x + x, area.y + y, area.width, area.height),
-                    image,
+                    after,
                 ));
             }
             vec![Line::from(" ".repeat(cols as usize)); rows as usize]
@@ -1855,6 +1853,21 @@ fn image_lines(
         )));
         lines.extend(picture(after, 0, top, width, rows));
     }
+    let cell = graphics::cell_size();
+    let places = match (sides.as_slice(), cell) {
+        ([(before, _), (after, _)], Some(cell)) => {
+            image_diff::together(diff, changes, *before, *after, cell)
+                .into_iter()
+                .collect()
+        }
+        _ => sides
+            .iter()
+            .filter_map(|&(area, after)| {
+                let width = cell.map(|(w, _)| u32::from(area.width) * w);
+                Some((area, image_diff::side(diff, after, changes, width)?))
+            })
+            .collect(),
+    };
     (lines, places)
 }
 

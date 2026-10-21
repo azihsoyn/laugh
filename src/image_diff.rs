@@ -64,12 +64,17 @@ struct Sharp {
 type SentKey = (bool, u32, u32);
 
 impl Sharp {
-    /// The picture to send for `changes`, about `width` pixels wide.
-    fn image(&self, changes: bool, width: Option<u32>) -> graphics::Image {
-        let source = match &self.changes {
+    /// The kept picture for `changes`.
+    fn pixels(&self, changes: bool) -> &RgbaImage {
+        match &self.changes {
             Some(dimmed) if changes => dimmed,
             _ => &self.plain,
-        };
+        }
+    }
+
+    /// The picture to send for `changes`, about `width` pixels wide.
+    fn image(&self, changes: bool, width: Option<u32>) -> graphics::Image {
+        let source = self.pixels(changes);
         let (w, h) = match width {
             Some(width) if width.div_ceil(STEP) * STEP < source.width() => {
                 let w = width.div_ceil(STEP) * STEP;
@@ -108,7 +113,12 @@ pub struct ImageDiff {
     pub changed_share: Option<f64>,
     /// Both sides saved full size, for an image viewer.
     pub files: Vec<PathBuf>,
+    /// Both sides in one picture, as last sent: see [`together`].
+    together: RefCell<Option<(TogetherKey, graphics::Image)>>,
 }
+
+/// Dimmed or not, where each side goes, and a cell's size in pixels.
+type TogetherKey = (bool, Rect, Rect, (u32, u32));
 
 impl ImageDiff {
     pub fn comparable(&self) -> bool {
@@ -228,6 +238,7 @@ pub fn compare(
         changed,
         changed_share,
         files: Vec::new(),
+        together: RefCell::new(None),
     })
 }
 
@@ -347,26 +358,71 @@ pub fn draw(
     lines
 }
 
-/// For a terminal that draws pictures itself: the image to place, and the
-/// cells it covers within `cols × rows`, centred and not stretched. With
-/// `cell_width` (in pixels) the image is shrunk to about the size shown.
-pub fn placement(
-    diff: &ImageDiff,
-    after: bool,
-    changes: bool,
-    cols: u16,
-    rows: u16,
-    ratio: f64,
-    cell_width: Option<u32>,
-) -> Option<(Rect, graphics::Image)> {
+/// For a terminal that draws pictures itself: the cells one side covers
+/// within `cols × rows`, centred and not stretched.
+pub fn placement(diff: &ImageDiff, after: bool, cols: u16, rows: u16, ratio: f64) -> Option<Rect> {
     let picture = if after { &diff.after } else { &diff.before };
-    let picture = picture.as_ref()?;
-    let sharp = picture.sharp.as_ref()?;
+    let picture = picture.as_ref().filter(|p| p.sharp.is_some())?;
     let s = scale(picture, cols, rows, ratio);
     let w = ((f64::from(picture.width) * s).round() as u16).clamp(1, cols.max(1));
     let h = ((f64::from(picture.height) * s / ratio).round() as u16).clamp(1, rows.max(1));
-    let area = Rect::new((cols - w) / 2, (rows - h) / 2, w, h);
-    let image = sharp.image(changes, cell_width.map(|c| u32::from(w) * c));
+    Some(Rect::new((cols - w) / 2, (rows - h) / 2, w, h))
+}
+
+/// One side's picture to send, shrunk to about `width` pixels when known.
+pub fn side(
+    diff: &ImageDiff,
+    after: bool,
+    changes: bool,
+    width: Option<u32>,
+) -> Option<graphics::Image> {
+    let picture = if after { &diff.after } else { &diff.before };
+    Some(picture.as_ref()?.sharp.as_ref()?.image(changes, width))
+}
+
+/// Both sides as one picture over `before` and `after` (cells, as
+/// [`placement`] gives them) with the space around them left clear. herdr
+/// hands pictures on to its terminal one at a time, each waiting for the
+/// last, so one picture shows both sides at once and sooner.
+pub fn together(
+    diff: &ImageDiff,
+    changes: bool,
+    before: Rect,
+    after: Rect,
+    cell: (u32, u32),
+) -> Option<(Rect, graphics::Image)> {
+    let sides = [
+        (diff.before.as_ref()?.sharp.as_ref()?, before),
+        (diff.after.as_ref()?.sharp.as_ref()?, after),
+    ];
+    let area = before.union(after);
+    let key = (changes, before, after, cell);
+    let mut sent = diff.together.borrow_mut();
+    if let Some((k, image)) = sent.as_ref()
+        && *k == key
+    {
+        return Some((area, image.clone()));
+    }
+    let (cw, ch) = cell;
+    let mut canvas = RgbaImage::new(u32::from(area.width) * cw, u32::from(area.height) * ch);
+    for (sharp, at) in sides {
+        let side = imageops::resize(
+            sharp.pixels(changes),
+            u32::from(at.width) * cw,
+            u32::from(at.height) * ch,
+            FilterType::Triangle,
+        );
+        imageops::replace(
+            &mut canvas,
+            &side,
+            i64::from((at.x - area.x) as u32 * cw),
+            i64::from((at.y - area.y) as u32 * ch),
+        );
+    }
+    let image = png(canvas);
+    if let Some((_, old)) = sent.replace((key, image.clone())) {
+        graphics::release(&old);
+    }
     Some((area, image))
 }
 
@@ -449,16 +505,38 @@ mod tests {
     fn the_terminal_is_sent_about_the_pixels_shown() {
         let img = RgbaImage::from_pixel(1000, 500, Rgba([0, 0, 255, 255]));
         let diff = compare(None, Some(&png(img)), true).unwrap();
-        let sent = |cell_width| {
-            let (area, image) = placement(&diff, true, false, 20, 20, 2.0, cell_width).unwrap();
-            let dims = image::load_from_memory(image.png()).unwrap();
-            (area.width, dims.width(), dims.height())
+        assert_eq!(
+            placement(&diff, true, 20, 20, 2.0),
+            Some(Rect::new(0, 7, 20, 5))
+        );
+        let sent = |width| {
+            let image = side(&diff, true, false, width).unwrap();
+            image::load_from_memory(image.png())
+                .unwrap()
+                .to_rgba8()
+                .dimensions()
         };
-        // 20 cells of 10 pixels: 200, up to the next step.
-        assert_eq!(sent(Some(10)), (20, 256, 128));
+        // 200 pixels shown: up to the next step.
+        assert_eq!(sent(Some(200)), (256, 128));
         // Unknown, or wider than kept: all of it.
-        assert_eq!(sent(None), (20, 1000, 500));
-        assert_eq!(sent(Some(100)), (20, 1000, 500));
+        assert_eq!(sent(None), (1000, 500));
+        assert_eq!(sent(Some(2000)), (1000, 500));
+    }
+
+    #[test]
+    fn both_sides_go_as_one_picture_with_the_gap_clear() {
+        let red = RgbaImage::from_pixel(8, 4, Rgba([255, 0, 0, 255]));
+        let blue = RgbaImage::from_pixel(8, 4, Rgba([0, 0, 255, 255]));
+        let diff = compare(Some(&png(red)), Some(&png(blue)), true).unwrap();
+        // One above the other, a label row between them.
+        let (before, after) = (Rect::new(2, 3, 4, 2), Rect::new(2, 6, 4, 2));
+        let (area, image) = together(&diff, false, before, after, (2, 4)).unwrap();
+        assert_eq!(area, Rect::new(2, 3, 4, 5));
+        let one = image::load_from_memory(image.png()).unwrap().to_rgba8();
+        assert_eq!(one.dimensions(), (8, 20));
+        assert_eq!(one.get_pixel(0, 0).0, [255, 0, 0, 255]);
+        assert_eq!(one.get_pixel(0, 10).0[3], 0);
+        assert_eq!(one.get_pixel(7, 19).0, [0, 0, 255, 255]);
     }
 
     #[test]
