@@ -5,6 +5,7 @@
 //! other). `c` dims everything that stayed the same,
 //! so what changed stands out.
 
+use std::cell::RefCell;
 use std::io::Cursor;
 use std::path::PathBuf;
 
@@ -20,9 +21,13 @@ const EXTENSIONS: &[&str] = &["png", "jpg", "jpeg", "gif", "webp", "bmp", "ico"]
 /// PR full of screenshots shouldn't fill the memory.
 const KEEP: u32 = 320;
 
-/// What the terminal is sent, when it draws pictures itself: plenty for a
-/// pane, small enough to send quickly.
+/// The most kept for a terminal that draws pictures itself: plenty for a
+/// pane. What it's sent is shrunk further to the pixels it's shown at.
 const SHARP: u32 = 1600;
+
+/// Sent widths go up in steps of this, so dragging a border doesn't send a
+/// new picture for every column.
+const STEP: u32 = 128;
 
 use crate::graphics;
 
@@ -46,9 +51,51 @@ pub struct Picture {
 }
 
 struct Sharp {
-    plain: graphics::Image,
+    plain: RgbaImage,
     /// With what stayed the same dimmed, when there's something to compare.
-    changes: Option<graphics::Image>,
+    changes: Option<RgbaImage>,
+    /// What the terminal was last sent: whether it was `changes`, its
+    /// size, and the picture. herdr hands pictures on as raw pixels, so
+    /// sending no more than are shown keeps them quick.
+    sent: RefCell<Option<(SentKey, graphics::Image)>>,
+}
+
+/// Dimmed or not, width, height.
+type SentKey = (bool, u32, u32);
+
+impl Sharp {
+    /// The picture to send for `changes`, about `width` pixels wide.
+    fn image(&self, changes: bool, width: Option<u32>) -> graphics::Image {
+        let source = match &self.changes {
+            Some(dimmed) if changes => dimmed,
+            _ => &self.plain,
+        };
+        let (w, h) = match width {
+            Some(width) if width.div_ceil(STEP) * STEP < source.width() => {
+                let w = width.div_ceil(STEP) * STEP;
+                let h = (u64::from(source.height()) * u64::from(w) / u64::from(source.width()))
+                    .max(1) as u32;
+                (w, h)
+            }
+            _ => source.dimensions(),
+        };
+        let key = (changes && self.changes.is_some(), w, h);
+        let mut sent = self.sent.borrow_mut();
+        if let Some((k, image)) = sent.as_ref()
+            && *k == key
+        {
+            return image.clone();
+        }
+        let image = if (w, h) == source.dimensions() {
+            png(source.clone())
+        } else {
+            png(imageops::resize(source, w, h, FilterType::Triangle))
+        };
+        if let Some((_, old)) = sent.replace((key, image.clone())) {
+            graphics::release(&old);
+        }
+        image
+    }
 }
 
 pub struct ImageDiff {
@@ -117,7 +164,7 @@ fn png(img: RgbaImage) -> graphics::Image {
     graphics::Image::new(out.into_inner())
 }
 
-/// The picture to send the terminal, and with `mask` the same with what
+/// The picture to keep for the terminal, and with `mask` the same with what
 /// didn't change dimmed.
 fn sharpen(img: &RgbaImage, mask: Option<&GrayImage>) -> Sharp {
     let big = shrink(img, SHARP);
@@ -130,11 +177,12 @@ fn sharpen(img: &RgbaImage, mask: Option<&GrayImage>) -> Sharp {
                 *p = Rgba([r / 4, g / 4, b / 4, a]);
             }
         }
-        png(dimmed)
+        dimmed
     });
     Sharp {
-        plain: png(big),
+        plain: big,
         changes,
+        sent: RefCell::new(None),
     }
 }
 
@@ -300,7 +348,8 @@ pub fn draw(
 }
 
 /// For a terminal that draws pictures itself: the image to place, and the
-/// cells it covers within `cols × rows`, centred and not stretched.
+/// cells it covers within `cols × rows`, centred and not stretched. With
+/// `cell_width` (in pixels) the image is shrunk to about the size shown.
 pub fn placement(
     diff: &ImageDiff,
     after: bool,
@@ -308,20 +357,17 @@ pub fn placement(
     cols: u16,
     rows: u16,
     ratio: f64,
+    cell_width: Option<u32>,
 ) -> Option<(Rect, graphics::Image)> {
     let picture = if after { &diff.after } else { &diff.before };
     let picture = picture.as_ref()?;
     let sharp = picture.sharp.as_ref()?;
-    let image = if changes {
-        sharp.changes.as_ref().unwrap_or(&sharp.plain)
-    } else {
-        &sharp.plain
-    };
     let s = scale(picture, cols, rows, ratio);
     let w = ((f64::from(picture.width) * s).round() as u16).clamp(1, cols.max(1));
     let h = ((f64::from(picture.height) * s / ratio).round() as u16).clamp(1, rows.max(1));
     let area = Rect::new((cols - w) / 2, (rows - h) / 2, w, h);
-    Some((area, image.clone()))
+    let image = sharp.image(changes, cell_width.map(|c| u32::from(w) * c));
+    Some((area, image))
 }
 
 /// `84 KB`, `1.2 MB`.
@@ -397,6 +443,22 @@ mod tests {
         assert_eq!(drawn, 5);
         assert!(!lines[2].spans.iter().any(|s| s.content == "▀"));
         assert!(lines[3].spans.iter().any(|s| s.content == "▀"));
+    }
+
+    #[test]
+    fn the_terminal_is_sent_about_the_pixels_shown() {
+        let img = RgbaImage::from_pixel(1000, 500, Rgba([0, 0, 255, 255]));
+        let diff = compare(None, Some(&png(img)), true).unwrap();
+        let sent = |cell_width| {
+            let (area, image) = placement(&diff, true, false, 20, 20, 2.0, cell_width).unwrap();
+            let dims = image::load_from_memory(image.png()).unwrap();
+            (area.width, dims.width(), dims.height())
+        };
+        // 20 cells of 10 pixels: 200, up to the next step.
+        assert_eq!(sent(Some(10)), (20, 256, 128));
+        // Unknown, or wider than kept: all of it.
+        assert_eq!(sent(None), (20, 1000, 500));
+        assert_eq!(sent(Some(100)), (20, 1000, 500));
     }
 
     #[test]

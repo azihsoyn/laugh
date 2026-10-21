@@ -23,6 +23,8 @@ use crate::viewed_sync::{Ledger, Outcome, Worker};
 use crate::{theme, ui};
 
 const ROOT: usize = 0;
+/// How many images below the cursor are fetched before you get to them.
+const IMAGES_AHEAD: usize = 3;
 
 /// A directory in the changed-file tree. Chains of directories with nothing
 /// but a single subdirectory are folded into one node (`a/b/c/`), as GitHub's
@@ -1093,7 +1095,8 @@ impl FilesView {
     }
 
     /// Collects fetched pictures, and starts fetching the selected image's
-    /// once the cursor has rested on it for a moment.
+    /// once the cursor has rested on it for a moment — then the next few
+    /// images down the list, one at a time, so moving on to them is quick.
     fn drain_images(&mut self) {
         for (file, result) in self.diff.image_rx.try_iter() {
             let state = match result {
@@ -1106,12 +1109,54 @@ impl FilesView {
         if !self.showing_image() || self.diff.since.elapsed() < Duration::from_millis(200) {
             return;
         }
-        let Some((file, change)) = self.selected_diff() else {
+        let Some(file) = self.selected_file() else {
             return;
         };
-        if self.diff.images.contains_key(&file) {
+        if !self.diff.images.contains_key(&file) {
+            self.fetch_pictures(file);
             return;
         }
+        if self
+            .diff
+            .images
+            .values()
+            .any(|p| matches!(p, Pictures::Loading))
+        {
+            return;
+        }
+        let at = self.table.selected().unwrap_or(0);
+        let ahead = self
+            .rows()
+            .into_iter()
+            .skip(at + 1)
+            .filter_map(|row| match row {
+                RowRef::File { file, .. } => Some(file),
+                RowRef::Dir(_) => None,
+            })
+            .filter(|&file| self.image_change(file).is_some())
+            .take(IMAGES_AHEAD)
+            .find(|file| !self.diff.images.contains_key(file));
+        if let Some(file) = ahead {
+            self.fetch_pictures(file);
+        }
+    }
+
+    /// The change to `file` when it's an image with no text patch.
+    fn image_change(&self, file: usize) -> Option<&github::FileDiff> {
+        let pf = &self.files[file];
+        match self.diff.patches.get(&pf.pr)? {
+            Patches::Loaded(map) => map
+                .get(&pf.path)
+                .filter(|d| d.patch.is_none() && image_diff::is_image(&pf.path)),
+            _ => None,
+        }
+    }
+
+    /// Fetches both sides of an image in the background and compares them.
+    fn fetch_pictures(&mut self, file: usize) {
+        let Some(change) = self.image_change(file) else {
+            return;
+        };
         let pf = &self.files[file];
         let Some(source) = self.sources.get(pf.pr) else {
             return;
@@ -1135,28 +1180,36 @@ impl FilesView {
                 github::fetch_file(&owner, &repo, path, rev).map_err(|e| format!("{e:#}"))
             };
             let result = (|| {
-                let before = match before_path {
-                    Some(path) => {
-                        let known = bases.lock().ok().and_then(|b| b.get(&pr).cloned());
-                        let from = match known {
-                            Some(from) => from,
-                            None => {
-                                let from = github::merge_base(&owner, &repo, &base, &head)
-                                    .map_err(|e| format!("{e:#}"))?;
-                                if let Ok(mut b) = bases.lock() {
-                                    b.insert(pr, from.clone());
+                // The two sides come down side by side.
+                let (before, after) = thread::scope(|s| {
+                    let before = s.spawn(|| match &before_path {
+                        Some(path) => {
+                            let known = bases.lock().ok().and_then(|b| b.get(&pr).cloned());
+                            let from = match known {
+                                Some(from) => from,
+                                None => {
+                                    let from = github::merge_base(&owner, &repo, &base, &head)
+                                        .map_err(|e| format!("{e:#}"))?;
+                                    if let Ok(mut b) = bases.lock() {
+                                        b.insert(pr, from.clone());
+                                    }
+                                    from
                                 }
-                                from
-                            }
-                        };
-                        Some(fetch(&path, &from)?)
-                    }
-                    None => None,
-                };
-                let after = match &after_path {
-                    Some(path) => Some(fetch(path, &head)?),
-                    None => None,
-                };
+                            };
+                            fetch(path, &from).map(Some)
+                        }
+                        None => Ok(None),
+                    });
+                    let after = match &after_path {
+                        Some(path) => fetch(path, &head).map(Some),
+                        None => Ok(None),
+                    };
+                    let before = before
+                        .join()
+                        .unwrap_or_else(|_| Err("fetch panicked".into()));
+                    (before, after)
+                });
+                let (before, after) = (before?, after?);
                 let mut diff =
                     image_diff::compare(before.as_deref(), after.as_deref(), graphics::enabled())?;
                 let here = format!("{owner}-{repo}-{number}");
@@ -1754,12 +1807,13 @@ fn image_lines(
     // Half blocks make square pixels of a cell's two halves; a terminal
     // drawing the picture itself needs the real shape of a cell.
     let fit_ratio = ratio.unwrap_or(2.0);
+    let cell_width = ratio.and(graphics::cell_width());
     let mut places = Vec::new();
     // One side's picture in `cols × rows` at (`x`, `y`) of the pane.
     let mut picture = |after: bool, x: u16, y: u16, cols: u16, rows: u16| match ratio {
         Some(ratio) => {
             if let Some((area, image)) =
-                image_diff::placement(diff, after, changes, cols, rows, ratio)
+                image_diff::placement(diff, after, changes, cols, rows, ratio, cell_width)
             {
                 places.push((
                     Rect::new(area.x + x, area.y + y, area.width, area.height),

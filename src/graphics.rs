@@ -11,6 +11,7 @@
 use std::cell::RefCell;
 use std::collections::HashSet;
 use std::io::{self, Write};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, OnceLock};
 
@@ -30,6 +31,11 @@ impl Image {
             id: NEXT.fetch_add(1, Ordering::Relaxed),
             png: Arc::new(png),
         }
+    }
+
+    #[cfg(test)]
+    pub fn png(&self) -> &[u8] {
+        &self.png
     }
 }
 
@@ -53,15 +59,25 @@ pub fn enabled() -> bool {
     })
 }
 
-/// How many times taller than wide a cell is, from the terminal's pixel
-/// size when it reports one.
-pub fn cell_ratio() -> f64 {
+/// A cell's width and height in pixels, when the terminal reports them.
+fn cell_pixels() -> Option<(f64, f64)> {
     match crossterm::terminal::window_size() {
-        Ok(s) if s.width > 0 && s.height > 0 && s.columns > 0 && s.rows > 0 => {
-            (f64::from(s.height) / f64::from(s.rows)) / (f64::from(s.width) / f64::from(s.columns))
-        }
-        _ => 2.0,
+        Ok(s) if s.width > 0 && s.height > 0 && s.columns > 0 && s.rows > 0 => Some((
+            f64::from(s.width) / f64::from(s.columns),
+            f64::from(s.height) / f64::from(s.rows),
+        )),
+        _ => None,
     }
+}
+
+/// How many times taller than wide a cell is; 2 when unknown.
+pub fn cell_ratio() -> f64 {
+    cell_pixels().map_or(2.0, |(w, h)| h / w)
+}
+
+/// How wide a cell is in pixels, when known.
+pub fn cell_width() -> Option<u32> {
+    cell_pixels().map(|(w, _)| w.ceil() as u32)
 }
 
 #[derive(Default)]
@@ -72,6 +88,8 @@ struct State {
     placed: Vec<(u32, Rect)>,
     /// Already sent to the terminal.
     sent: HashSet<u32>,
+    /// Sent, but replaced: to be deleted from the terminal.
+    released: Vec<u32>,
 }
 
 thread_local! {
@@ -83,6 +101,15 @@ pub fn want(image: &Image, area: Rect) {
     STATE.with_borrow_mut(|s| s.wanted.push((image.clone(), area)));
 }
 
+/// `image` won't be placed again: the terminal can let it go.
+pub fn release(image: &Image) {
+    STATE.with_borrow_mut(|s| {
+        if s.sent.remove(&image.id) {
+            s.released.push(image.id);
+        }
+    });
+}
+
 /// After a frame: places what was wanted and removes what wasn't. With
 /// `show` false (a popup is open over them) nothing is placed.
 pub fn flush(out: &mut impl Write, show: bool) -> io::Result<()> {
@@ -92,12 +119,24 @@ pub fn flush(out: &mut impl Write, show: bool) -> io::Result<()> {
             wanted.clear();
         }
         let keys: Vec<(u32, Rect)> = wanted.iter().map(|(i, a)| (i.id, *a)).collect();
-        if keys == s.placed {
+        let released = std::mem::take(&mut s.released);
+        if keys == s.placed && released.is_empty() {
             return Ok(());
+        }
+        if keys == s.placed {
+            // Nothing placed moves; the released images were already off
+            // screen.
+            for id in released {
+                delete(out, id)?;
+            }
+            return out.flush();
         }
         if !s.placed.is_empty() {
             // Every placement goes; the images stay sent.
             write!(out, "\x1b_Ga=d,d=a,q=2\x1b\\")?;
+        }
+        for id in released {
+            delete(out, id)?;
         }
         for (image, area) in &wanted {
             if s.sent.insert(image.id) {
@@ -120,8 +159,62 @@ pub fn flush(out: &mut impl Write, show: bool) -> io::Result<()> {
     })
 }
 
-/// Sends an image's PNG in the protocol's 4096-byte chunks.
+/// True when images go to the terminal as files it reads itself rather
+/// than as data. herdr takes a file far faster: data it unpacks and hands
+/// on to the terminal it runs in pixel by pixel. A file only works on the
+/// same machine, so not over SSH. `LAUGH_GRAPHICS_FILE=1` or `=0` decides
+/// by hand.
+fn by_file() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        let var = |k: &str| std::env::var(k).unwrap_or_default();
+        match var("LAUGH_GRAPHICS_FILE").as_str() {
+            "1" => return true,
+            "0" => return false,
+            _ => {}
+        }
+        cfg!(not(test))
+            && var("HERDR_ENV") == "1"
+            && std::env::var_os("SSH_CONNECTION").is_none()
+            && std::env::var_os("SSH_TTY").is_none()
+    })
+}
+
+/// Where an image sent as a file is written.
+fn file_for(id: u32) -> PathBuf {
+    std::env::temp_dir()
+        .join("laugh")
+        .join("graphics")
+        .join(format!("{}-{id}.png", std::process::id()))
+}
+
+/// Takes an image off the terminal, and its file if it had one.
+fn delete(out: &mut impl Write, id: u32) -> io::Result<()> {
+    write!(out, "\x1b_Ga=d,d=I,i={id},q=2\x1b\\")?;
+    if by_file() {
+        let _ = std::fs::remove_file(file_for(id));
+    }
+    Ok(())
+}
+
+/// Sends an image: as a file (see [`by_file`]), or its PNG in the
+/// protocol's 4096-byte chunks.
 fn send(out: &mut impl Write, image: &Image) -> io::Result<()> {
+    if by_file() {
+        let path = file_for(image.id);
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir)?;
+        }
+        std::fs::write(&path, &*image.png)?;
+        // The terminal wants it absolute, and macOS's temp dir is a link.
+        let path = path.canonicalize()?;
+        return write!(
+            out,
+            "\x1b_Ga=t,t=f,f=100,i={},q=2;{}\x1b\\",
+            image.id,
+            base64(path.to_string_lossy().as_bytes())
+        );
+    }
     let data = base64(&image.png);
     let chunks: Vec<&[u8]> = data.as_bytes().chunks(4096).collect();
     for (i, chunk) in chunks.iter().enumerate() {
@@ -171,7 +264,7 @@ pub fn clear(out: &mut impl Write) -> io::Result<()> {
             return Ok(());
         }
         for id in s.sent.drain() {
-            write!(out, "\x1b_Ga=d,d=I,i={id},q=2\x1b\\")?;
+            delete(out, id)?;
         }
         s.placed.clear();
         out.flush()
@@ -218,5 +311,22 @@ mod tests {
         want(&image, Rect::new(4, 3, 10, 5));
         flush(&mut out, false).unwrap();
         assert_eq!(String::from_utf8(out).unwrap(), "\x1b_Ga=d,d=a,q=2\x1b\\");
+    }
+
+    #[test]
+    fn a_released_image_is_deleted_from_the_terminal() {
+        let image = Image::new(vec![1, 2, 3]);
+        let mut out = Vec::new();
+        want(&image, Rect::new(0, 0, 4, 4));
+        flush(&mut out, true).unwrap();
+        out.clear();
+
+        // Never sent: nothing to delete.
+        release(&Image::new(vec![4]));
+        release(&image);
+        flush(&mut out, false).unwrap();
+        let out = String::from_utf8(out).unwrap();
+        assert!(out.contains(&format!("a=d,d=I,i={},q=2", image.id)));
+        assert_eq!(out.matches("d=I").count(), 1);
     }
 }
