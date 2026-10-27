@@ -241,6 +241,7 @@ link.
 | `tab` `shift-tab` | next / previous screen |
 | `[` `]` | All PRs, or one at a time |
 | `R` | refresh: fetch the PRs again, staying where you are |
+| `M` | mouse off / on: off, drag to select text |
 | `?` | every key |
 | `q` | quit (after anything still being saved) |
 
@@ -280,7 +281,8 @@ button or a row of the files tree, and scroll with the wheel — it scrolls what
 the pointer: the diff beside the files, or a thread or its code. Drag the border between two
 side-by-side panes to make one wider; each screen's split is remembered for next time, along
 with `H`. While laugh has the mouse, most terminals need Shift (or
-Option) held to select text.
+Option) held to select text; `M` hands the mouse back to the terminal
+(herdr included) so a plain drag selects, and `M` again takes it back.
 
 ## `--json`
 

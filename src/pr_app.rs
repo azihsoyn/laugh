@@ -104,6 +104,8 @@ struct PrApp {
     refresh_hit: Option<Rect>,
     /// Outcome of the last refresh, for the footer.
     status: Option<Note>,
+    /// Whether laugh takes the mouse; off, the terminal selects text.
+    mouse: bool,
 }
 
 impl PrApp {
@@ -339,6 +341,7 @@ impl PrApp {
             watch,
             refresh_hit: None,
             status: None,
+            mouse: true,
         }
     }
 }
@@ -397,6 +400,10 @@ fn event_loop(terminal: &mut Term, app: &mut PrApp, prefs: &mut prefs::Prefs) ->
             KeyCode::Char('q') | KeyCode::Esc => return Ok(()),
             KeyCode::Char('?') => app.help = true,
             KeyCode::Char('R') => app.start_refresh(),
+            KeyCode::Char('M') => {
+                app.mouse = !app.mouse;
+                term::set_mouse(terminal, app.mouse)?;
+            }
             KeyCode::Char('1') => app.screen = Screen::Files,
             KeyCode::Char('2') => app.screen = Screen::Threads,
             KeyCode::Char('3') => app.screen = Screen::Checks,
@@ -450,6 +457,9 @@ fn open_externally(terminal: &mut Term, app: &PrApp, request: &OpenRequest) -> R
         )
         .status();
     term::resume(terminal)?;
+    if !app.mouse {
+        term::set_mouse(terminal, false)?;
+    }
     graphics::forget_placements();
     Ok(match status {
         Ok(s) if s.success() => format!("opened {}", request.path),
@@ -716,6 +726,9 @@ fn draw_footer(f: &mut ratatui::Frame<'_>, area: Rect, app: &PrApp) {
     if app.prs.len() > 1 {
         hints.push(("[ ]", "PR"));
     }
+    if !app.mouse {
+        hints.push(("M", "mouse back on"));
+    }
     hints.extend([("?", "keys"), ("q", "quit")]);
     let mut spans = vec![Span::raw(" ")];
     spans.extend(ui::key_hints(&hints));
@@ -757,6 +770,7 @@ const HELP: &[(&str, &[(&str, &str)])] = &[
             ("tab  ⇧tab", "next / previous screen"),
             ("[  ]", "all PRs / one PR at a time"),
             ("R", "refresh: fetch the PRs again, staying where you are"),
+            ("M", "mouse off / on: off, drag to select text"),
             ("?", "this list"),
             ("q", "quit (waits for pending saves)"),
         ],

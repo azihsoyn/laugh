@@ -35,6 +35,17 @@ pub fn resume(terminal: &mut Term) -> Result<()> {
     Ok(())
 }
 
+/// Turns mouse reporting on or off. Off, the terminal takes the mouse
+/// back: dragging selects text to copy.
+pub fn set_mouse(terminal: &mut Term, on: bool) -> Result<()> {
+    if on {
+        execute!(terminal.backend_mut(), EnableMouseCapture)?;
+    } else {
+        execute!(terminal.backend_mut(), DisableMouseCapture)?;
+    }
+    Ok(())
+}
+
 /// Runs `body` on the alternate screen in raw mode with mouse reporting on,
 /// restoring the terminal afterwards whether or not `body` failed.
 pub fn with_terminal(body: impl FnOnce(&mut Term) -> Result<()>) -> Result<()> {
